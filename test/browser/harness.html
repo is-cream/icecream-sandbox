@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>browser-sandbox browser harness</title>
+</head>
+<body>
+<script type="module">
+  import { Sandbox, renderGuestTree } from "/dist/index.js";
+
+  // Test-only harness: drives one Sandbox and exposes it to Playwright
+  // through window.harness. Never shipped to users.
+  const messages = [];
+  const errors = [];
+  const prompts = [];
+  const events = [];
+  let sandbox = null;
+  let appRoot = null;
+
+  window.harness = {
+    async create() {
+      sandbox = await Sandbox.create({ iframeUrl: "/iframe.html" });
+      sandbox.on("message", (m) => messages.push(m));
+      sandbox.on("error", (e) => errors.push(e));
+      return true;
+    },
+    async createConnection({ allowedOrigins, autoDecision }) {
+      // autoDecision null means NO approval callback (deny by default).
+      const options = { iframeUrl: "/iframe.html" };
+      if (allowedOrigins) options.allowedOrigins = allowedOrigins;
+      if (autoDecision !== null && autoDecision !== undefined) {
+        options.onConnectionRequest = (req) => {
+          prompts.push(req.origin);
+          return autoDecision;
+        };
+      }
+      sandbox = await Sandbox.create(options);
+      sandbox.on("message", (m) => messages.push(m));
+      sandbox.on("error", (e) => errors.push(e));
+      return true;
+    },
+    getPrompts() { return prompts.slice(); },
+    getGrants() { return sandbox.getConnectionGrants(); },
+    revokeGrant(origin) { return sandbox.revokeConnectionGrant(origin); },
+    renderApp(tree, cssText) {
+      if (!appRoot) {
+        appRoot = document.createElement("div");
+        appRoot.id = "app-root";
+        document.body.appendChild(appRoot);
+      }
+      return renderGuestTree(appRoot, tree, {
+        cssText,
+        onEvent: (id, value) => events.push({ id, value }),
+      });
+    },
+    getEvents() { return events.slice(); },
+    clearEvents() { events.length = 0; },
+    getShadowText() {
+      return appRoot && appRoot.shadowRoot ? appRoot.shadowRoot.textContent : "";
+    },
+    getShadowStyle() {
+      if (!appRoot || !appRoot.shadowRoot) return "";
+      const style = appRoot.shadowRoot.querySelector("style");
+      return style ? style.textContent : "";
+    },
+    getShadowHtml() {
+      return appRoot && appRoot.shadowRoot ? appRoot.shadowRoot.innerHTML : "";
+    },
+    shadowHas(selector) {
+      return appRoot && appRoot.shadowRoot
+        ? appRoot.shadowRoot.querySelector(selector) !== null
+        : false;
+    },
+    getShadowComputedColor(selector) {
+      const el = appRoot.shadowRoot.querySelector(selector);
+      return el ? getComputedStyle(el).color : "";
+    },
+    clickShadow(selector) {
+      const el = appRoot.shadowRoot.querySelector(selector);
+      el.click();
+    },
+    run(code, limits) {
+      return sandbox.run(code, limits);
+    },
+    send(message) {
+      sandbox.send(message);
+    },
+    registerAskUpper() {
+      sandbox.registerAsk("upper", (arg) => arg.toUpperCase());
+    },
+    registerAskNever() {
+      sandbox.registerAsk("never", () => new Promise(() => undefined));
+    },
+    getMessages() { return messages.slice(); },
+    getErrors() { return errors.slice(); },
+    iframeInfo() {
+      const frame = document.querySelector("iframe");
+      if (!frame) return null;
+      return {
+        sandboxAttr: frame.getAttribute("sandbox"),
+        contentDocumentNull: frame.contentDocument === null,
+      };
+    },
+    postWrongNonceWatchdog() {
+      const frame = document.querySelector("iframe");
+      frame.contentWindow.postMessage(
+        { type: "sandbox-watchdog", nonce: "definitely-not-the-nonce" },
+        "*",
+      );
+    },
+    postFromAttacker() {
+      // A srcdoc iframe inherits the harness origin, so it can reach the
+      // sandbox iframe's window — but the sandbox iframe trusts only its
+      // original parent's event.source, so this must be ignored.
+      return new Promise((resolve) => {
+        const attacker = document.createElement("iframe");
+        attacker.srcdoc = `<script>
+          const target = parent.document.querySelector("iframe");
+          target.contentWindow.postMessage(
+            { type: "sandbox-watchdog", nonce: "whatever" }, "*");
+          parent.postMessage("attacker-posted", "*");
+        <\/script>`;
+        const onDone = (event) => {
+          if (event.data === "attacker-posted") {
+            window.removeEventListener("message", onDone);
+            attacker.remove();
+            resolve(true);
+          }
+        };
+        window.addEventListener("message", onDone);
+        document.body.appendChild(attacker);
+      });
+    },
+    dispose() {
+      if (sandbox) sandbox.dispose();
+      sandbox = null;
+    },
+  };
+  window.harnessReady = true;
+</script>
+</body>
+</html>

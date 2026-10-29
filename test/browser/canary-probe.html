@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>canary probe</title>
+</head>
+<body>
+<script>
+  // Runs inside a sandboxed iframe served with the same CSP as the real
+  // iframe document. Attempts fetch, XHR, and WebSocket to the canary
+  // server, then reports each outcome to the parent. Under
+  // connect-src 'none', every attempt must fail before any request
+  // reaches the canary — the canary's own log is the proof.
+  (function () {
+    var results = {};
+    function done() {
+      if (results.fetch && results.xhr && results.ws) {
+        parent.postMessage({ type: "canary-results", results: results }, "*");
+      }
+    }
+    try {
+      fetch("http://localhost:8902/ping-fetch")
+        .then(function () { results.fetch = "UNEXPECTED SUCCESS"; done(); })
+        .catch(function (e) { results.fetch = "blocked: " + e.name; done(); });
+    } catch (e) { results.fetch = "blocked-sync: " + e.name; done(); }
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open("GET", "http://localhost:8902/ping-xhr");
+      xhr.onerror = function () { results.xhr = "blocked"; done(); };
+      xhr.onload = function () { results.xhr = "UNEXPECTED SUCCESS"; done(); };
+      xhr.send();
+    } catch (e) { results.xhr = "blocked-sync: " + e.name; done(); }
+    try {
+      var ws = new WebSocket("ws://localhost:8902/ping-ws");
+      ws.onerror = function () { results.ws = "blocked"; done(); };
+      ws.onopen = function () { results.ws = "UNEXPECTED SUCCESS"; done(); };
+    } catch (e) { results.ws = "blocked-sync: " + e.name; done(); }
+    // Safety net: report whatever we have after 3s.
+    setTimeout(function () {
+      if (!results.fetch) results.fetch = "no-result";
+      if (!results.xhr) results.xhr = "no-result";
+      if (!results.ws) results.ws = "no-result";
+      parent.postMessage({ type: "canary-results", results: results }, "*");
+    }, 3000);
+  })();
+</script>
+</body>
+</html>

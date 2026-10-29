@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>World population 1920 to now — browser-sandbox example</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; }
+  #app-root { border: 1px solid #ccc; border-radius: 12px; padding: 1rem 1.25rem; margin: 1rem 0; }
+  #status { background: #111; color: #eee; padding: 0.75rem 1rem; border-radius: 8px; min-height: 1.5rem; }
+  code { background: #f0f0f0; padding: 0 0.25rem; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>World population, 1920 to now</h1>
+<p>
+  This chart is <strong>not</strong> host code. It is a guest component:
+  JavaScript running inside QuickJS in a Web Worker inside a sandboxed
+  iframe (<code>browser-sandbox</code>). The guest describes its UI as
+  data; the host renders it inside a shadow root. The guest cannot touch
+  this page's DOM, cannot fetch anything itself, and cannot navigate
+  anywhere on its own.
+</p>
+<p>
+  Click a bar to see that decade's detail. Switch views between total
+  population and growth per decade. Click a source link and the
+  <strong>host asks you first</strong> — the click never navigates on
+  its own, because the link carries an event id and the renderer
+  prevent-defaults gated links. Approve, and the host opens it;
+  deny, and nothing happens.
+</p>
+<div id="app-root"></div>
+<p id="status">Loading guest app…</p>
+<p>
+  Figures are rounded UN World Population Prospects estimates, in
+  billions. 2025 is an estimate, five years after 2020, so its growth
+  figure covers five years, not ten. Sources below open only with your
+  approval.
+</p>
+
+<!-- Guest code. type="text/plain" so the browser does not execute it;
+     the host reads it and runs it inside the sandbox. -->
+<script type="text/plain" id="guest-code">
+(function () {
+  var DATA = [
+    { year: 1920, pop: 1.86 },
+    { year: 1930, pop: 2.07 },
+    { year: 1940, pop: 2.30 },
+    { year: 1950, pop: 2.53 },
+    { year: 1960, pop: 3.03 },
+    { year: 1970, pop: 3.70 },
+    { year: 1980, pop: 4.46 },
+    { year: 1990, pop: 5.33 },
+    { year: 2000, pop: 6.14 },
+    { year: 2010, pop: 7.00 },
+    { year: 2020, pop: 7.89 },
+    { year: 2025, pop: 8.23 }
+  ];
+  var CSS = [
+    ".chart { display: flex; align-items: flex-end; gap: 6px; height: 250px; border-bottom: 2px solid #333; padding: 0 4px; }",
+    ".bar-wrap { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; height: 100%; justify-content: flex-end; }",
+    ".bar { width: 100%; background: #4a90d9; border: none; border-radius: 4px 4px 0 0; cursor: pointer; color: white; font-size: 10px; padding: 0; }",
+    ".bar.selected { background: #e07b39; }",
+    ".bar-label { font-size: 11px; color: #333; }",
+    ".value { font-size: 11px; font-weight: bold; }",
+    ".detail { margin-top: 16px; padding: 12px 16px; background: #f4f4f4; border-radius: 8px; }",
+    ".toggle { margin-bottom: 12px; }",
+    ".toggle button { margin-right: 8px; padding: 6px 12px; border-radius: 6px; border: 1px solid #999; background: #fff; cursor: pointer; }",
+    ".toggle button.active { background: #333; color: #fff; }",
+    ".links a { color: #1a0dab; text-decoration: underline; cursor: pointer; margin-right: 18px; }"
+  ].join("\n");
+
+  var selected = 2000;
+  var view = "pop";
+
+  function point(year) {
+    for (var i = 0; i < DATA.length; i++) {
+      if (DATA[i].year === year) return DATA[i];
+    }
+    return DATA[0];
+  }
+  function indexOf(year) {
+    for (var i = 0; i < DATA.length; i++) {
+      if (DATA[i].year === year) return i;
+    }
+    return 0;
+  }
+  function growthAt(i) {
+    if (i === 0) return null;
+    var prev = DATA[i - 1].pop;
+    return ((DATA[i].pop - prev) / prev) * 100;
+  }
+  function fmt(n, digits) {
+    var m = Math.pow(10, digits);
+    return String(Math.round(n * m) / m);
+  }
+  function barHeight(i) {
+    if (view === "pop") {
+      return Math.round((DATA[i].pop / 8.23) * 100);
+    }
+    var g = growthAt(i);
+    if (g === null) return 0;
+    return Math.round((g / 22.5) * 100);
+  }
+  function barValue(i) {
+    if (view === "pop") return fmt(DATA[i].pop, 2);
+    var g = growthAt(i);
+    return g === null ? "-" : "+" + fmt(g, 1) + "%";
+  }
+
+  function render() {
+    var bars = [];
+    for (var i = 0; i < DATA.length; i++) {
+      var d = DATA[i];
+      bars.push({
+        type: "div",
+        props: { className: "bar-wrap" },
+        children: [
+          { type: "span", props: { className: "value" }, children: [barValue(i)] },
+          {
+            type: "button",
+            props: {
+              className: d.year === selected ? "bar selected" : "bar",
+              style: { height: String(barHeight(i)) + "%" },
+              onClick: "bar:" + d.year,
+              title: String(d.year)
+            },
+            children: [" "]
+          },
+          { type: "span", props: { className: "bar-label" }, children: [String(d.year)] }
+        ]
+      });
+    }
+    var sel = point(selected);
+    var si = indexOf(selected);
+    var detail = [];
+    detail.push({ type: "h3", children: [String(sel.year) + (sel.year === 2025 ? " (estimate, now)" : "")] });
+    detail.push({ type: "p", children: ["Population: " + fmt(sel.pop, 2) + " billion"] });
+    if (si === 0) {
+      detail.push({ type: "p", children: ["No earlier decade in this series to compare with."] });
+    } else {
+      var prev = DATA[si - 1];
+      var g = growthAt(si);
+      var years = sel.year - prev.year;
+      detail.push({ type: "p", children: [
+        "Growth since " + prev.year + " (" + years + " years): +" +
+        fmt(sel.pop - prev.pop, 2) + " billion (+" + fmt(g, 1) + "%)"
+      ] });
+    }
+    var tree = {
+      type: "div",
+      children: [
+        { type: "h2", children: ["World population, 1920 to now"] },
+        { type: "p", children: [view === "pop"
+          ? "Total population in billions. Click a bar for details."
+          : "Growth per decade in percent. 2025 covers five years since 2020. Click a bar for details."] },
+        { type: "div", props: { className: "toggle" }, children: [
+          { type: "button", props: { className: view === "pop" ? "active" : "", onClick: "view:pop" }, children: ["Population"] },
+          { type: "button", props: { className: view === "growth" ? "active" : "", onClick: "view:growth" }, children: ["Growth per decade"] }
+        ] },
+        { type: "div", props: { className: "chart" }, children: bars },
+        { type: "div", props: { className: "detail" }, children: detail },
+        { type: "div", props: { className: "links" }, children: [
+          { type: "a", props: { href: "https://population.un.org/wpp/", onClick: "link:un" }, children: ["UN World Population Prospects"] },
+          { type: "a", props: { href: "https://data.worldbank.org/indicator/SP.POP.TOTL", onClick: "link:wb" }, children: ["World Bank population data"] }
+        ] }
+      ]
+    };
+    host.send(JSON.stringify({ kind: "render", tree: tree, css: CSS }));
+  }
+
+  globalThis.onMessage = function (m) {
+    var msg = JSON.parse(m);
+    if (msg.kind !== "event") return;
+    var id = msg.id;
+    if (id.indexOf("bar:") === 0) {
+      selected = parseInt(id.slice(4), 10);
+      render();
+    } else if (id === "view:pop" || id === "view:growth") {
+      view = id.slice(5);
+      render();
+    }
+  };
+
+  render();
+  return new Promise(function () {});
+})();
+</script>
+
+<script type="module">
+  import { Sandbox, renderGuestTree } from "/dist/index.js";
+
+  // The host owns the link destinations. The guest's href is display-only:
+  // clicking never navigates on its own, because the link carries an
+  // onClick id and the renderer prevent-defaults gated links.
+  const LINK_URLS = {
+    "link:un": "https://population.un.org/wpp/",
+    "link:wb": "https://data.worldbank.org/indicator/SP.POP.TOTL",
+  };
+
+  const statusEl = document.getElementById("status");
+  const setStatus = (line) => { statusEl.textContent = line; };
+  let renderedOnce = false;
+
+  const sandbox = await Sandbox.create({ iframeUrl: "/iframe.html" });
+  sandbox.on("message", (m) => {
+    try {
+      const msg = JSON.parse(m);
+      if (msg && msg.kind === "render") {
+        renderGuestTree(document.getElementById("app-root"), msg.tree, {
+          cssText: msg.css,
+          onEvent: (id) => {
+            if (id in LINK_URLS) {
+              // Human-in-the-loop approval for the click.
+              const url = LINK_URLS[id];
+              const ok = confirm("Open this link?\n\n" + url + "\n\nIt comes from the guest app. Opening it is your decision.");
+              setStatus(ok ? "Approved: opened " + url : "Denied: did not open " + url);
+              if (ok) window.open(url, "_blank", "noopener");
+              return;
+            }
+            sandbox.send(JSON.stringify({ kind: "event", id }));
+          },
+        });
+        // Only announce the first render: later renders (bar clicks, view
+        // switches) must not overwrite an approval/denial status line.
+        if (!renderedOnce) {
+          renderedOnce = true;
+          setStatus("Guest app rendered. Click a bar, switch views, or try a source link.");
+        }
+      }
+    } catch { /* not a render message */ }
+  });
+  sandbox.on("error", (e) => setStatus("Guest error: " + e));
+
+  const code = document.getElementById("guest-code").textContent;
+  void sandbox.run(code, { deadlineMs: 60000 });
+</script>
+</body>
+</html>

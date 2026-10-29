@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>browser-sandbox demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+  textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; }
+  #log { white-space: pre-wrap; background: #111; color: #eee; padding: 1rem; min-height: 8rem; }
+  button { margin-right: 0.5rem; }
+</style>
+</head>
+<body>
+<h1>browser-sandbox demo</h1>
+<p>
+  Guest code runs inside QuickJS (WebAssembly) in a Web Worker inside a
+  sandboxed iframe. It can only reach the host through
+  <code>host.send</code>, <code>host.ask</code>, and the gated
+  <code>host.fetchText</code> (the host fetches only after you approve).
+  Try the buttons, or edit the code — an infinite loop stops at the
+  deadline instead of hanging the page.
+</p>
+<p>
+  <button id="run">Run guest code</button>
+  <button id="loop">Infinite loop (1s deadline)</button>
+  <button id="probe">Probe guest globals</button>
+</p>
+<textarea id="code" rows="8">host.send("hello from the guest");
+"done: " + (1 + 2)</textarea>
+<p>
+  <input id="hostmsg" placeholder="message from host to guest" size="40">
+  <button id="send">Send to guest</button>
+</p>
+<h2>Gated connections</h2>
+<p>
+  The guest has no network. It can only <em>ask</em> the host to fetch,
+  and the host asks you first (this demo uses <code>confirm</code>; a real
+  app shows its own approval UI). OK grants the origin for this session;
+  Cancel denies.
+</p>
+<p>
+  <input id="fetchurl" size="50">
+  <button id="fetchcss">Fetch through the gate</button>
+  <button id="revoke">Revoke grants</button>
+  <span id="grants"></span>
+</p>
+<h2>Guest app rendering</h2>
+<p>
+  The counter below is guest code: it fetches a stylesheet through the
+  gate, then sends an element tree that the host renders inside a shadow
+  root. Clicking +1 round-trips back to the guest, which re-renders.
+  (The app holds the run while it lives; stop it before running other
+  code.)
+</p>
+<p>
+  <button id="counter">Run counter app</button>
+  <button id="stopcounter">Stop counter app</button>
+</p>
+<div id="app-root" style="border: 1px solid #ccc; padding: 1rem; margin: 1rem 0;"></div>
+<pre id="log"></pre>
+<script type="module">
+  import { Sandbox, renderGuestTree } from "/dist/index.js";
+
+  const logEl = document.getElementById("log");
+  const log = (line) => { logEl.textContent += line + "\n"; };
+  const showGrants = () => {
+    document.getElementById("grants").textContent =
+      "grants: " + (sandbox.getConnectionGrants().join(", ") || "(none)");
+  };
+
+  const sandbox = await Sandbox.create({
+    iframeUrl: "/iframe.html",
+    onConnectionRequest: (req) => {
+      log("connection asked: " + req.url);
+      return confirm("Allow the guest app to fetch from " + req.origin + "?\n\nOK = allow for this session, Cancel = deny.") ? "allow-session" : "deny";
+    },
+  });
+  sandbox.on("message", (m) => {
+    try {
+      const msg = JSON.parse(m);
+      if (msg && msg.kind === "render") {
+        renderGuestTree(document.getElementById("app-root"), msg.tree, {
+          cssText: msg.css,
+          onEvent: (id) => sandbox.send(JSON.stringify({ kind: "event", id })),
+        });
+        log("rendered guest app (CSS traps, if any, were stripped).");
+        return;
+      }
+    } catch { /* not a render message: log it below */ }
+    log("guest says: " + m);
+  });
+  sandbox.on("error", (e) => log("guest error: " + e));
+  sandbox.registerAsk("upper", (arg) => arg.toUpperCase());
+  log("sandbox ready. Ask 'upper' is registered.");
+  showGrants();
+
+  document.getElementById("run").onclick = async () => {
+    try {
+      const result = await sandbox.run(document.getElementById("code").value);
+      log("result: " + result);
+    } catch (e) { log("run failed: " + e.message); }
+  };
+  document.getElementById("loop").onclick = async () => {
+    try {
+      await sandbox.run("while (true) {}", { deadlineMs: 1000 });
+    } catch (e) { log("loop stopped: " + e.message); }
+  };
+  document.getElementById("probe").onclick = async () => {
+    const probe = [
+      "fetch", "XMLHttpRequest", "WebSocket", "setTimeout", "process",
+      "require", "document", "window", "localStorage", "indexedDB",
+    ];
+    const code = probe.map((n) => n + "=" + "(typeof " + n + ")").join("; ") +
+      '; "host=" + (typeof host)';
+    try {
+      log("probe: " + await sandbox.run(code));
+    } catch (e) { log("probe failed: " + e.message); }
+  };
+  document.getElementById("send").onclick = () => {
+    sandbox.send(document.getElementById("hostmsg").value);
+    log("host sent a message (guest sees it if it defined onMessage).");
+  };
+
+  // The guest can answer host messages by defining globalThis.onMessage.
+  document.getElementById("code").value =
+    'globalThis.onMessage = (m) => { host.send("guest got: " + m); };\n' +
+    'host.send("guest is listening for host messages");\n"ready"';
+
+  document.getElementById("fetchurl").value = location.origin + "/theme.css";
+  document.getElementById("fetchcss").onclick = async () => {
+    const url = document.getElementById("fetchurl").value;
+    const code = `(async () => { return await host.fetchText(${JSON.stringify(url)}); })()`;
+    try {
+      log("fetched body: " + await sandbox.run(code, { deadlineMs: 10000 }));
+    } catch (e) { log("fetch failed: " + e.message); }
+    showGrants();
+  };
+  document.getElementById("revoke").onclick = () => {
+    sandbox.clearConnectionGrants();
+    showGrants();
+    log("grants revoked; the next fetch will ask again.");
+  };
+
+  document.getElementById("counter").onclick = () => {
+    const cssUrl = location.origin + "/theme.css";
+    const code = `
+      (async () => {
+        let css = "";
+        try { css = await host.fetchText(${JSON.stringify(cssUrl)}); }
+        catch (e) { host.send("CSS fetch failed: " + e); }
+        let count = 0;
+        let stopRun = null;
+        const render = () => JSON.stringify({ kind: "render", tree: { type: "div", children: [
+          { type: "p", children: ["count: " + count] },
+          { type: "button", props: { onClick: "inc" }, children: ["+1"] }
+        ]}, css: css });
+        globalThis.onMessage = (m) => {
+          const msg = JSON.parse(m);
+          if (msg.kind === "event" && msg.id === "inc") { count++; host.send(render()); }
+          if (msg.kind === "stop" && stopRun !== null) stopRun();
+        };
+        host.send(render());
+        await new Promise((resolve) => { stopRun = resolve; });
+        return "counter stopped";
+      })()
+    `;
+    void sandbox.run(code, { deadlineMs: 60000 }).then(
+      (result) => log(result),
+      (e) => log("counter failed: " + e.message),
+    );
+    log("counter app started (it holds the run; stop it before other runs).");
+  };
+  document.getElementById("stopcounter").onclick = () => {
+    try {
+      sandbox.send(JSON.stringify({ kind: "stop" }));
+    } catch (e) { log("stop failed: " + e.message); }
+  };
+</script>
+</body>
+</html>

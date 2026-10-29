@@ -1,0 +1,41 @@
+{
+  "name": "browser-sandbox",
+  "version": "0.2.0",
+  "description": "Run untrusted JavaScript in the browser inside QuickJS (WebAssembly) in a Web Worker inside a sandboxed iframe. No network, no DOM, no storage for guest code.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/host.d.ts",
+      "default": "./dist/host.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepublishOnly": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:browser": "playwright test",
+    "test:security": "vitest run test/security && playwright test security",
+    "demo": "node demo/demo-server.mjs"
+  },
+  "dependencies": {
+    "@jitl/quickjs-singlefile-cjs-release-sync": "0.32.0",
+    "quickjs-emscripten-core": "0.32.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.55.0",
+    "@types/node": "22.19.0",
+    "esbuild": "0.25.5",
+    "typescript": "5.9.2",
+    "vitest": "3.2.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
