@@ -23,6 +23,7 @@ import {
   ConnectionGate,
   type ConnectionApprovalHandler,
 } from "./connections.js";
+import { ImportCache, type ImportMap } from "./imports.js";
 
 export interface SandboxOptions {
   /** URL of the served iframe document (dist/iframe.html). Required. */
@@ -78,6 +79,13 @@ export class Sandbox {
   private readonly options: SandboxOptions;
   private readonly doc: Document;
   private readonly gate: ConnectionGate;
+  /**
+   * Downloaded module sources, keyed by resolved URL. Lives on the
+   * Sandbox (not on a session) for the same reason grants do: a
+   * watchdog rebuild must neither re-download nor re-prompt for a
+   * module already imported. Cleared on dispose().
+   */
+  private readonly importCache = new ImportCache();
   private iframe: HTMLIFrameElement | null = null;
   private session: Session | null = null;
   private nonce = "";
@@ -116,9 +124,44 @@ export class Sandbox {
     return sandbox;
   }
 
-  run(code: string, limits?: RunLimits): Promise<string> {
+  /**
+   * Run guest code. When the code uses static imports, `imports` is the
+   * import map (bare specifier -> absolute module URL, pinned version).
+   * Every module is downloaded through the connection gate (one
+   * human-in-the-loop approval per origin, then session grants) and
+   * cached here, so a second run importing the same URL downloads
+   * nothing and prompts nobody. See imports.ts.
+   */
+  run(code: string, limits?: RunLimits, imports?: ImportMap): Promise<string> {
     if (this.disposed) return Promise.reject(new Error("sandbox is disposed"));
-    return this.withSession(async (session) => session.run(code, this.mergeLimits(limits)));
+    return this.withSession(async (session) =>
+      session.run(code, this.mergeLimits(limits), imports),
+    );
+  }
+
+  /**
+   * Download one module source: cache hit returns immediately, otherwise
+   * the connection gate fetches it (allowlist, session grant, or a
+   * human-in-the-loop approval) and the result is cached. Imported code
+   * runs inside the guest realm with guest limits — downloading never
+   * grants it anything the guest does not already have.
+   */
+  async importModule(url: string): Promise<string> {
+    const cached = this.importCache.get(url);
+    if (cached !== undefined) return cached;
+    const source = await this.gate.fetchText(url);
+    this.importCache.set(url, source);
+    return source;
+  }
+
+  /** URLs of cached module sources, in first-cached order. A copy. */
+  getImportCache(): string[] {
+    return this.importCache.keys();
+  }
+
+  /** Drop all cached module sources. The next import re-downloads. */
+  clearImportCache(): void {
+    this.importCache.clear();
   }
 
   send(message: string): void {
@@ -171,6 +214,7 @@ export class Sandbox {
     if (this.disposed) return;
     this.disposed = true;
     this.gate.clearGrants();
+    this.importCache.clear();
     this.terminateWorker();
     if (this.session !== null) {
       this.session.dispose();
@@ -242,6 +286,9 @@ export class Sandbox {
     // Connection requests route to the gate, which lives on the Sandbox so
     // grants survive this session's rebuilds.
     session.onConnectionRequest = (url) => this.gate.fetchText(url);
+    // Import requests route through the same gate via the import cache,
+    // so downloads inherit every gate protection (and its approvals).
+    session.onImportRequest = (url) => this.importModule(url);
     session.on("message", (message) => {
       for (const listener of this.messageListeners) listener(message);
     });

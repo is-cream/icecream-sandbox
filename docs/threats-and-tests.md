@@ -276,6 +276,62 @@ Test name references below are exact. Unit tests live in
   network happens during startup; `npm ci` in CI enforces the lock
   file.
 
+## Module imports
+
+### T23. Malicious imported module code
+
+- **Attack:** a downloaded module that tries to escape the guest
+  realm, read host state, or fetch on its own.
+- **Prevention:** imported code runs inside the same guest realm
+  under the same limits, with the same single `host` global. It has
+  no DOM, storage, network, or host objects, and its only network
+  path is the gate. Importing grants nothing.
+- **Tests:** browser imports `imported module code has no more power
+  than classic guest code` (a module guest probes host globals: all
+  undefined, while the imported function works).
+
+### T24. Import-map poisoning and guest-controlled specifiers
+
+- **Attack:** guest code importing a specifier the app never
+  approved, or rewriting the map to point a trusted name at an
+  attacker URL.
+- **Prevention:** the map is host-supplied per run and never crosses
+  into the guest realm — the guest cannot read or change it. Bare
+  specifiers resolve only through the map; an unmapped one fails the
+  run naming the specifier. Map values must be absolute http(s)
+  URLs, validated host-side before the run starts.
+- **Tests:** unit `resolveSpecifier` (unmapped bare, non-http(s)
+  schemes, relative-without-base); browser imports `unknown
+  specifier fails naming the specifier`.
+
+### T25. Cache poisoning and stale modules
+
+- **Attack:** guest code planting a malicious module in the cache so
+  a later import executes it, or a silently-updated module changing
+  behavior under a trusted name.
+- **Prevention:** the cache is host-side, keyed by resolved URL,
+  written only by the host's own download path — the guest has no
+  handle to it. Version pinning is the app's job: the map points at
+  exact versions, and the library never re-resolves or updates
+  anything on its own. The cache dies on `dispose()`.
+- **Tests:** browser imports `second import is cached` (request
+  counts prove the second import downloads nothing; `getImportCache`
+  shows exactly the one URL).
+
+### T26. Transitive import exfiltration (second-origin smuggling)
+
+- **Attack:** a trusted module that imports from a second origin,
+  riding the first origin's approval to fetch attacker code.
+- **Prevention:** every hop is resolved and gated on its own origin.
+  Relative hops inherit the importing module's origin (still subject
+  to that origin's grant); absolute hops to a new origin need that
+  origin's own approval. A grant never carries across origins, and
+  redirects are rejected outright.
+- **Tests:** browser imports `transitive relative imports resolve`
+  (same-origin hop works) and `every transitive hop is gated on its
+  own origin` (a cross-origin hop prompts a second time, for the
+  second origin).
+
 ## Bugs caught by this suite
 
 The security suite is not decorative — it has already caught real

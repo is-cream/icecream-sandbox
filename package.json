@@ -1,6 +1,6 @@
 {
   "name": "icecream-sandbox",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Run untrusted JavaScript in the browser inside QuickJS (WebAssembly) in a Web Worker inside a sandboxed iframe. No network, no DOM, no storage for guest code.",
   "license": "PolyForm-Noncommercial-1.0.0",
   "type": "module",

@@ -131,6 +131,11 @@ Key details:
   assertion (`gc object list not empty`).
 - A run's runtime is never reused — least of all after an
   out-of-memory error, where the heap may be corrupt.
+- Module runs insert one step between installing the host global and
+  evaluating: the worker pre-fetches the static import graph (see
+  [Module imports](#module-imports)) and only then evaluates with
+  `type: "module"`. Classic scripts skip that step entirely and
+  behave exactly as before.
 
 ## Messaging and asks
 
@@ -210,6 +215,63 @@ host UI by construction — the library never renders it.
 Why credentials are omitted: the host fetch must never ride the host
 page's login. A guest that could trigger authenticated requests would
 turn the gate into a confused deputy.
+
+## Module imports
+
+```mermaid
+sequenceDiagram
+    participant App as host app
+    participant SB as Sandbox
+    participant Gate as ConnectionGate
+    participant Cache as ImportCache
+    participant W as worker / GuestRunner
+    participant Q as QuickJS module loader
+    App->>SB: run(module code, limits, importMap)
+    SB->>W: run message (code + limits + importMap)
+    W->>W: scan entry code for static imports
+    loop over the import graph, breadth-first
+        W->>W: resolve specifier (map or relative URL)
+        W->>SB: import-request(url)
+        SB->>Cache: hit?
+        Cache-->>SB: miss
+        SB->>Gate: fetchText(url) — approval per origin
+        Gate-->>SB: source (or denial error)
+        SB->>Cache: store source
+        SB->>W: import-result(source)
+        W->>W: scan source for its imports, enqueue
+    end
+    W->>Q: setModuleLoader(loader from map, normalizer)
+    W->>Q: evalCode(code, type: "module")
+    Q->>Q: loader serves pre-fetched sources
+    Q-->>W: namespace (or top-level-await promise)
+    W-->>SB: result "" (module side effects already sent)
+```
+
+Key details:
+
+- The split is forced by QuickJS, not chosen: the module loader is
+  synchronous and cannot await a fetch, so all async work (gate
+  approval, download) happens before evaluation, over the port, where
+  async is natural. The loader then serves only what prefetch already
+  downloaded — it can never trigger a download the gate did not
+  approve.
+- The normalizer canonicalizes every specifier the loader will ever
+  see: bare names through the import map, relatives through URL
+  resolution against the importing module's URL. An unmapped bare
+  name, a relative import in entry code (which has no URL), or a
+  non-http(s) result fails the run with the specifier named.
+- The cache lives on the Sandbox, next to the grants, for the same
+  reason: a watchdog rebuild must neither re-download nor re-prompt
+  for a module already imported. Grants and cache both die on
+  `dispose()`.
+- A module run's result is `""` when the module finishes
+  synchronously — its namespace is not a result. A top-level await
+  that never settles keeps the run alive for events, exactly like a
+  classic long-lived app; the run deadline still bounds it.
+- Bounds: `maxImportModules` (graph size), `maxImportDepth` (chain
+  depth), the run deadline (which covers fetching too), the gate's
+  response cap, and the port's `maxInboundBytes` (a module source
+  must fit both to cross).
 
 ## Guest UI rendering
 

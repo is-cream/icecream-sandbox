@@ -27,6 +27,10 @@ export interface RunLimits {
   maxOutstandingFetches?: number;
   /** Max total bytes the guest may send to the host during one run. Default 1 MiB. */
   maxTotalOutputBytes?: number;
+  /** Max modules fetched for one run's import graph (entry + transitive). Default 64. */
+  maxImportModules?: number;
+  /** Max import depth: entry imports are depth 0. Default 16. */
+  maxImportDepth?: number;
 }
 
 export interface ResolvedLimits {
@@ -38,6 +42,8 @@ export interface ResolvedLimits {
   maxOutstandingAsks: number;
   maxOutstandingFetches: number;
   maxTotalOutputBytes: number;
+  maxImportModules: number;
+  maxImportDepth: number;
 }
 
 export const DEFAULT_LIMITS: ResolvedLimits = {
@@ -49,6 +55,8 @@ export const DEFAULT_LIMITS: ResolvedLimits = {
   maxOutstandingAsks: 8,
   maxOutstandingFetches: 4,
   maxTotalOutputBytes: 1024 * 1024,
+  maxImportModules: 64,
+  maxImportDepth: 16,
 };
 
 /** Hard ceiling for maxStackSize: anything above this is rejected, never clamped. */
@@ -91,6 +99,16 @@ export function resolveLimits(input?: RunLimits): ResolvedLimits {
       "maxTotalOutputBytes",
       input?.maxTotalOutputBytes,
       DEFAULT_LIMITS.maxTotalOutputBytes,
+    ),
+    maxImportModules: positiveInt(
+      "maxImportModules",
+      input?.maxImportModules,
+      DEFAULT_LIMITS.maxImportModules,
+    ),
+    maxImportDepth: positiveInt(
+      "maxImportDepth",
+      input?.maxImportDepth,
+      DEFAULT_LIMITS.maxImportDepth,
     ),
   };
   if (limits.maxStackSize > MAX_STACK_SIZE) {

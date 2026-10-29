@@ -39,6 +39,26 @@
       sandbox.on("error", (e) => errors.push(e));
       return true;
     },
+    async createImport({ importMap, allowedOrigins, autoDecision }) {
+      // Same prompt machinery as createConnection, but the Sandbox is
+      // used for module runs: runWithImports passes the import map.
+      const options = { iframeUrl: "/iframe.html" };
+      if (allowedOrigins) options.allowedOrigins = allowedOrigins;
+      if (autoDecision !== null && autoDecision !== undefined) {
+        options.onConnectionRequest = (req) => {
+          prompts.push(req.origin);
+          return autoDecision;
+        };
+      }
+      sandbox = await Sandbox.create(options);
+      sandbox.on("message", (m) => messages.push(m));
+      sandbox.on("error", (e) => errors.push(e));
+      return true;
+    },
+    runWithImports(code, limits, importMap) {
+      return sandbox.run(code, limits, importMap);
+    },
+    getImportCache() { return sandbox.getImportCache(); },
     getPrompts() { return prompts.slice(); },
     getGrants() { return sandbox.getConnectionGrants(); },
     revokeGrant(origin) { return sandbox.revokeConnectionGrant(origin); },

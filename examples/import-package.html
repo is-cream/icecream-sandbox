@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guest app with a real npm import — icecream-sandbox example</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; }
+  #app-root { border: 1px solid #ccc; border-radius: 12px; padding: 1rem 1.25rem; margin: 1rem 0; }
+  #status { background: #111; color: #eee; padding: 0.75rem 1rem; border-radius: 8px; min-height: 1.5rem; }
+  code { background: #f0f0f0; padding: 0 0.25rem; border-radius: 4px; }
+  button#rerun { font-size: 1rem; padding: 0.5rem 1rem; }
+</style>
+</head>
+<body>
+<h1>Guest app with a real npm import</h1>
+<p>
+  This app is <strong>not</strong> host code. It is a guest ES module
+  running inside QuickJS in a Web Worker inside a sandboxed iframe
+  (<code>icecream-sandbox</code>). Its first line is
+  <code>import { format } from 'd3-format'</code> — a real published
+  package, not a stub. There is no install step: the host's import map
+  points that specifier at a URL, and the sandbox downloads it through
+  the same connection gate as any guest fetch.
+</p>
+<p>
+  On the first run the host asks you to approve the download origin
+  (one approval). Approve, and the module downloads and runs. Press
+  <strong>Re-run</strong> and the same import comes from the host-side
+  cache: no new prompt, no new download. Change the number or pick a
+  format and the guest re-renders using the imported
+  <code>format</code> function.
+</p>
+<div id="app-root"></div>
+<p><button id="rerun" type="button">Re-run (from cache)</button></p>
+<p id="status">Loading guest app…</p>
+<p>
+  The vendored module is the byte-identical published d3-format 3.1.2
+  ESM bundle (see <code>examples/vendor/NOTICE.md</code>). In production
+  an app would point its import map at a CDN instead; the download
+  mechanism — gate approval, then caching — is identical either way.
+</p>
+
+<!-- Guest code. type="text/plain" so the browser does not execute it;
+     the host reads it and runs it inside the sandbox as a module. -->
+<script type="text/plain" id="guest-code">
+import { format } from 'd3-format';
+var SPECS = ['.2f', ',.0f', '.0%', '($.2f'];
+var state = { value: 1234567.891, spec: '.2f' };
+var done = null;
+function tree() {
+  var fmt = format(state.spec);
+  var buttons = [];
+  for (var i = 0; i < SPECS.length; i++) {
+    buttons.push({ type: 'button', props: { onClick: 'spec:' + SPECS[i] }, children: [SPECS[i]] });
+  }
+  return { type: 'div', children: [
+    { type: 'p', children: ['Type a number, pick a format:'] },
+    { type: 'input', props: { type: 'number', value: String(state.value), onInput: 'input' } },
+    { type: 'div', children: buttons },
+    { type: 'p', children: ['Formatted (' + state.spec + '): ' + fmt(state.value)] },
+    { type: 'p', children: ['Powered by d3-format, imported as a guest ES module.'] }
+  ] };
+}
+function render() {
+  host.send(JSON.stringify({ kind: 'render', tree: tree() }));
+}
+globalThis.onMessage = function (m) {
+  try {
+    var msg = JSON.parse(m);
+    if (msg.kind === 'event') {
+      if (msg.id === 'input') { state.value = Number(msg.value); render(); }
+      else if (msg.id.indexOf('spec:') === 0) { state.spec = msg.id.slice(5); render(); }
+    } else if (msg.kind === 'quit') {
+      if (done !== null) done();
+    }
+  } catch (e) {}
+};
+render();
+// Stay alive for input events until the host asks us to quit.
+await new Promise(function (r) { done = r; });
+</script>
+
+<script type="module">
+  import { Sandbox, renderGuestTree } from "/dist/index.js";
+
+  const statusEl = document.getElementById("status");
+  const setStatus = (line) => { statusEl.textContent = line; };
+  let prompts = 0;
+
+  // The import map: bare specifier -> pinned module URL. In production
+  // this would point at a CDN; here it points at the vendored real
+  // d3-format build so the example works without internet.
+  const IMPORTS = { "d3-format": location.origin + "/vendor/d3-format.mjs" };
+
+  const sandbox = await Sandbox.create({
+    iframeUrl: "/iframe.html",
+    onConnectionRequest: (req) => {
+      // Human-in-the-loop approval for the download origin.
+      prompts++;
+      const ok = confirm("Allow the guest app to download a module from?\n\n" + req.origin + "\n\nThis is the one-time approval for the d3-format import. Later runs use the cache and never ask again.");
+      return ok ? "allow-session" : "deny";
+    },
+  });
+  let renderedOnce = false;
+  let renderWaiter = null;
+  sandbox.on("message", (m) => {
+    try {
+      const msg = JSON.parse(m);
+      if (msg && msg.kind === "render") {
+        renderGuestTree(document.getElementById("app-root"), msg.tree, {
+          onEvent: (id, value) => sandbox.send(JSON.stringify({ kind: "event", id, value })),
+        });
+        // Only announce the first render: later renders (typing, format
+        // switches) must not overwrite the re-run status line.
+        if (!renderedOnce) {
+          renderedOnce = true;
+          setStatus("Guest app rendered. Import prompts: " + prompts + ". Modules cached: " + sandbox.getImportCache().length + ".");
+        }
+        if (renderWaiter !== null) {
+          const resolve = renderWaiter;
+          renderWaiter = null;
+          resolve();
+        }
+      }
+    } catch { /* not a render message */ }
+  });
+  sandbox.on("error", (e) => setStatus("Guest error: " + e));
+
+  const code = document.getElementById("guest-code").textContent;
+  let currentRun = sandbox.run(code, { deadlineMs: 60000 }, IMPORTS);
+  // A healthy run stays alive for events until quit; only a failure
+  // reports here (a denial, for example).
+  currentRun.then(
+    () => {},
+    (e) => setStatus("Guest error: " + e.message),
+  );
+
+  document.getElementById("rerun").addEventListener("click", async () => {
+    // End the live run cleanly, then start it again. The second run's
+    // import comes from the host-side cache: no prompt, no download.
+    // We wait for the new run's first render, not its completion — a
+    // healthy run stays alive for events until the next quit.
+    sandbox.send(JSON.stringify({ kind: "quit" }));
+    try { await currentRun; } catch { /* the run may already have ended */ }
+    setStatus("Previous run ended. Re-running from cache…");
+    const rendered = new Promise((resolve) => { renderWaiter = resolve; });
+    currentRun = sandbox.run(code, { deadlineMs: 60000 }, IMPORTS);
+    currentRun.then(
+      () => {},
+      (e) => setStatus("Guest error: " + e.message),
+    );
+    await rendered;
+    setStatus("Re-ran: import prompts still " + prompts + ", modules cached " + sandbox.getImportCache().length + " — no new prompt, no new download.");
+  });
+</script>
+</body>
+</html>

@@ -93,6 +93,19 @@ const server = createServer((req, res) => {
       );
       return;
     }
+    if (path.startsWith("/vendor/")) {
+      // Vendored real packages for the import example (e.g.
+      // /vendor/d3-format.mjs). Mapped to examples/vendor/ with the
+      // same traversal guard as /examples/.
+      const file = normalize(join(root, "examples", path));
+      if (!file.startsWith(join(root, "examples/vendor") + "/")) {
+        res.writeHead(403); res.end("forbidden"); return;
+      }
+      const ext = file.slice(file.lastIndexOf("."));
+      res.writeHead(200, { "content-type": MIME[ext] || "application/octet-stream" });
+      res.end(readFileSync(file));
+      return;
+    }
     if (path.startsWith("/examples/")) {
       // Example pages (e.g. /examples/population-chart.html).
       const file = normalize(join(root, path));

@@ -44,6 +44,12 @@ variant embeds its WASM as base64, so nothing is fetched at runtime).
   session grants, or your approval callback. GET only, credentials
   omitted, redirects rejected, response size-capped. See
   [Gated connections](#gated-connections-human-in-the-loop).
+- **Guest ES module imports.** Guest code may `import` real packages:
+  the host's import map points a bare specifier at a pinned URL, the
+  sandbox downloads it through the same connection gate (one approval
+  per origin), and caches it — a second import downloads nothing and
+  prompts nobody. See
+  [Guest ES module imports](#guest-es-module-imports).
 - **Guest UI rendering (JSX / React components).** Guest components
   describe UI as element-tree data; the host renders it with real DOM
   inside a shadow root, with sanitized CSS and event round-trips. See
@@ -130,11 +136,20 @@ The demo server (`demo/demo-server.mjs`) shows the exact headers.
 | `maxConnectionResponseBytes` | 1 MiB | Max response body bytes returned to the guest per connection. A response must also fit `maxInboundBytes` to cross the port. |
 | `connectionTimeoutMs` | 10000 | Per-connection timeout. |
 
-### `sandbox.run(code, limits?)`
+### `sandbox.run(code, limits?, imports?)`
 
 Runs guest code in a **fresh** QuickJS runtime and context, and resolves
 with the guest's string result. A non-string result is rejected. After
 any limit error, the runtime is discarded, never reused.
+
+When the code uses static `import` statements, `imports` is the import
+map (bare specifier → absolute module URL, pinned version), and the run
+evaluates as a real QuickJS module. A module run's job is its side
+effects (`host.send`, event handlers): a module that finishes
+synchronously resolves to `""`, and a top-level await that never
+settles keeps the run alive for events exactly like a classic
+long-lived app. See
+[Guest ES module imports](#guest-es-module-imports).
 
 ### `sandbox.send(message)`
 
@@ -184,6 +199,8 @@ Terminates the worker, closes the port, removes the iframe.
 | `maxOutstandingAsks` | 8 | The 9th concurrent ask throws inside the guest. |
 | `maxOutstandingFetches` | 4 | The 5th concurrent `host.fetchText` throws inside the guest. |
 | `maxTotalOutputBytes` | 1 MiB | Total `host.send` bytes per run. |
+| `maxImportModules` | 64 | Modules fetched for one run's import graph (entry + transitive). |
+| `maxImportDepth` | 16 | Import depth; entry imports are depth 0. |
 | watchdog | 1.5 × deadline | The host kills the session if no result arrives; the next run rebuilds a fresh session (new worker, new handshake). |
 
 Messages between host, iframe, and worker are **JSON strings only** —
@@ -241,6 +258,63 @@ Example — a guest app fetching CDN CSS, if the user allows it:
 const css = await host.fetchText("https://cdn.jsdelivr.net/npm/normalize.css@8.0.1/normalize.css");
 host.send(JSON.stringify({ kind: "render", tree: /* ... */, css }));
 ```
+
+## Guest ES module imports
+
+Guest code may use static `import` statements — including real
+packages, not just relative files. There is no install step: the host
+app declares an import map, and the sandbox does the rest.
+
+```js
+const sandbox = await Sandbox.create({ iframeUrl: "/sandbox/iframe.html" });
+await sandbox.run(
+  `import { format } from 'd3-format';
+   host.send(format('.2f')(3.14159));`,
+  { deadlineMs: 10000 },
+  { "d3-format": "https://cdn.jsdelivr.net/npm/d3-format@3.1.2/+esm" },
+);
+```
+
+How it works:
+
+- **The import map is host-owned.** Bare specifiers (`'d3-format'`)
+  resolve through the map; an unmapped specifier fails the run naming
+  the specifier. The guest can neither read nor change the map.
+- **Downloads go through the connection gate.** The first download
+  from an origin needs the usual approval (developer allowlist, a
+  session grant, or your approval callback); every transitive hop is
+  gated on its own origin, so a module cannot smuggle in a second
+  origin under the first one's grant. Redirects are rejected, fetches
+  are GET-only with credentials omitted, and bodies are size-capped.
+- **Downloads are cached.** The host keeps downloaded sources keyed
+  by resolved URL, across runs and across watchdog session rebuilds,
+  until `dispose()` or `clearImportCache()`. A second import of the
+  same URL downloads nothing and prompts nobody — that is the
+  one-time-approval behavior, not a second grant.
+- **Evaluation uses real module semantics.** The worker pre-fetches
+  the whole static import graph before evaluating anything (QuickJS's
+  module loader is synchronous and cannot await a fetch), then loads
+  from the pre-fetched map with real imports/exports — no source
+  rewriting. Relative imports resolve against the importing module's
+  URL, so a fetched module can import its own siblings. The entry
+  module has no URL, so relative imports in guest entry code are an
+  error — map entry imports instead.
+- **Imported code gains nothing.** It runs inside the same guest
+  realm, under the same limits, with the same single `host` global.
+  Its network still goes through the gate; it has no DOM, storage,
+  or host objects.
+- **Pin your versions.** The map points at exact versions for a
+  reason: a floating specifier is supply-chain drift. The library
+  does not re-resolve or update anything on its own.
+
+Limits: only static imports are resolved. Dynamic `import()` with a
+computed specifier cannot be pre-fetched and fails at runtime with a
+clear error. A module source must also fit `maxInboundBytes` to cross
+the port (default 1 MiB, same as the gate's response cap).
+
+See `examples/import-package.html` for a working guest app that
+imports the real d3-format package, and `docs/design.md` for the
+resolution diagram.
 
 ## Rendering guest UI (JSX / React components)
 
@@ -377,6 +451,12 @@ are unavailable.
   approval before the host opens them. Run `npm run demo`, then open
   `/examples/population-chart.html`. A screenshot of it is in
   `examples/population-chart.png`.
+- `examples/import-package.html` — a guest ES module that imports the
+  real d3-format package: approve the download once, format numbers
+  with the imported function, then press Re-run and watch the same
+  import come from the cache with no new prompt and no new download.
+  Run `npm run demo`, then open `/examples/import-package.html`. A
+  screenshot of it is in `examples/import-package.png`.
 
 ## Development
 

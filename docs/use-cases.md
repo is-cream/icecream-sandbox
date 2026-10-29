@@ -262,6 +262,29 @@ radius of a bad policy is one string result and one error, not host
 compromise. Review for correctness, not for escape, because escape
 is what the sandbox removes.
 
+## 11. Guest apps with npm dependencies
+
+A guest component that needs a real library — a number formatter, a
+date library, a chart helper — instead of reimplementing it badly in
+guest code.
+
+```js
+const sandbox = await Sandbox.create({ iframeUrl: "/sandbox/iframe.html" });
+await sandbox.run(
+  `import { format } from 'd3-format';
+   host.send(format(',.2f')(1234567.891));`,
+  { deadlineMs: 10000 },
+  { "d3-format": "https://cdn.jsdelivr.net/npm/d3-format@3.1.2/+esm" },
+);
+```
+
+The app declares the import map with pinned versions; the first
+download from each origin needs the usual approval, and later imports
+come from the cache. The imported library runs inside the guest realm
+with guest limits — it cannot touch the host page, and its own network
+still goes through the gate. See
+`examples/import-package.html` for a working app.
+
 ## What icecream-sandbox is not
 
 - **Not a DOM sandbox for arbitrary web pages.** A guest HTML page

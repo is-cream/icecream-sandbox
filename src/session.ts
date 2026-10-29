@@ -15,6 +15,7 @@ import {
   type ResolvedLimits,
   type RunLimits,
 } from "./limits.js";
+import { validateImportMap, type ImportMap } from "./imports.js";
 
 export type AskHandler = (arg: string) => string | Promise<string>;
 
@@ -55,6 +56,13 @@ export class Session {
    * guest connection request is answered with an error — fail closed.
    */
   onConnectionRequest: ((url: string) => Promise<string>) | null = null;
+  /**
+   * Host-side import handler (Sandbox.importModule: cache, then the same
+   * gate). When null, every worker import request is answered with an
+   * error — fail closed. Imports never bypass the gate: the handler is
+   * what routes them through it.
+   */
+  onImportRequest: ((url: string) => Promise<string>) | null = null;
   /** Resolved when the worker's ready message arrives with the right nonce. */
   readonly ready: Promise<void>;
   private readyResolve: () => void = () => undefined;
@@ -94,15 +102,17 @@ export class Session {
     this.askHandlers.set(name, handler);
   }
 
-  run(code: string, limitsInput?: RunLimits): Promise<string> {
+  run(code: string, limitsInput?: RunLimits, importsInput?: ImportMap): Promise<string> {
     if (this.disposed) return Promise.reject(new Error("session is disposed"));
     if (this.failed) return Promise.reject(new Error("session failed; create a new session"));
     if (this.pendingRun !== null) {
       return Promise.reject(new Error("a run is already in flight on this session"));
     }
     let limits: ResolvedLimits;
+    let imports: ImportMap;
     try {
       limits = resolveLimits(limitsInput);
+      imports = validateImportMap(importsInput ?? {});
     } catch (error) {
       return Promise.reject(error instanceof Error ? error : new Error(String(error)));
     }
@@ -127,7 +137,7 @@ export class Session {
         }
       }, limits.deadlineMs * WATCHDOG_MULTIPLIER);
       this.pendingRun = { id, resolve, reject, watchdog };
-      this.port.postMessage(encodeMessage({ t: "run", id, code, limits }));
+      this.port.postMessage(encodeMessage({ t: "run", id, code, limits, imports }));
     });
   }
 
@@ -208,6 +218,38 @@ export class Session {
         void this.answerConnection(message.id, message.url);
         return;
       }
+      case "import-request": {
+        void this.answerImport(message.id, message.url);
+        return;
+      }
+    }
+  }
+
+  private async answerImport(id: number, url: string): Promise<void> {
+    if (this.onImportRequest === null) {
+      this.post({ t: "import-error", id, error: "imports are not enabled" });
+      return;
+    }
+    try {
+      const value = await this.onImportRequest(url);
+      if (typeof value !== "string") {
+        this.post({ t: "import-error", id, error: "import handler returned a non-string" });
+        return;
+      }
+      if (value.length > this.maxInboundBytes) {
+        // Same backstop as connections: a module source must fit the port.
+        // The gate's maxResponseBytes is the operative limit; this only
+        // catches a handler that ignored it.
+        this.post({ t: "import-error", id, error: "import response exceeds maxInboundBytes" });
+        return;
+      }
+      this.post({ t: "import-result", id, value });
+    } catch (error) {
+      this.post({
+        t: "import-error",
+        id,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -273,7 +315,9 @@ export class Session {
       | { t: "ask-result"; id: number; value: string }
       | { t: "ask-error"; id: number; error: string }
       | { t: "connection-result"; id: number; value: string }
-      | { t: "connection-error"; id: number; error: string },
+      | { t: "connection-error"; id: number; error: string }
+      | { t: "import-result"; id: number; value: string }
+      | { t: "import-error"; id: number; error: string },
   ): void {
     if (this.disposed || this.failed) return;
     try {

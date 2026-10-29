@@ -6,15 +6,18 @@
  * anything malformed is ignored (fail closed) rather than acted on.
  */
 import type { ResolvedLimits } from "./limits.js";
+import type { ImportMap } from "./imports.js";
 
 /** Host -> worker. */
 export type HostToWorkerMessage =
-  | { t: "run"; id: number; code: string; limits: ResolvedLimits }
+  | { t: "run"; id: number; code: string; limits: ResolvedLimits; imports: ImportMap }
   | { t: "send"; message: string }
   | { t: "ask-result"; id: number; value: string }
   | { t: "ask-error"; id: number; error: string }
   | { t: "connection-result"; id: number; value: string }
   | { t: "connection-error"; id: number; error: string }
+  | { t: "import-result"; id: number; value: string }
+  | { t: "import-error"; id: number; error: string }
   | { t: "dispose" };
 
 /** Worker -> host. */
@@ -25,6 +28,7 @@ export type WorkerToHostMessage =
   | { t: "message"; message: string }
   | { t: "ask"; id: number; name: string; arg: string }
   | { t: "connection-request"; id: number; url: string }
+  | { t: "import-request"; id: number; url: string }
   | { t: "guest-error"; error: string };
 
 export function encodeMessage(message: HostToWorkerMessage | WorkerToHostMessage): string {
@@ -56,8 +60,15 @@ export function decodeMessage(
     case "run":
       return typeof record["id"] === "number" &&
         typeof record["code"] === "string" &&
-        isResolvedLimits(record["limits"])
-        ? { t: "run", id: record["id"], code: record["code"], limits: record["limits"] }
+        isResolvedLimits(record["limits"]) &&
+        isImportMap(record["imports"])
+        ? {
+            t: "run",
+            id: record["id"],
+            code: record["code"],
+            limits: record["limits"],
+            imports: record["imports"],
+          }
         : null;
     case "send":
       return typeof record["message"] === "string" ? { t: "send", message: record["message"] } : null;
@@ -76,6 +87,14 @@ export function decodeMessage(
     case "connection-error":
       return typeof record["id"] === "number" && typeof record["error"] === "string"
         ? { t: "connection-error", id: record["id"], error: record["error"] }
+        : null;
+    case "import-result":
+      return typeof record["id"] === "number" && typeof record["value"] === "string"
+        ? { t: "import-result", id: record["id"], value: record["value"] }
+        : null;
+    case "import-error":
+      return typeof record["id"] === "number" && typeof record["error"] === "string"
+        ? { t: "import-error", id: record["id"], error: record["error"] }
         : null;
     case "dispose":
       return { t: "dispose" };
@@ -103,6 +122,10 @@ export function decodeMessage(
       return typeof record["id"] === "number" && typeof record["url"] === "string"
         ? { t: "connection-request", id: record["id"], url: record["url"] }
         : null;
+    case "import-request":
+      return typeof record["id"] === "number" && typeof record["url"] === "string"
+        ? { t: "import-request", id: record["id"], url: record["url"] }
+        : null;
     case "guest-error":
       return typeof record["error"] === "string"
         ? { t: "guest-error", error: record["error"] }
@@ -124,6 +147,15 @@ function isResolvedLimits(value: unknown): value is ResolvedLimits {
     "maxOutstandingAsks",
     "maxOutstandingFetches",
     "maxTotalOutputBytes",
+    "maxImportModules",
+    "maxImportDepth",
   ];
   return fields.every((field) => typeof record[field] === "number");
+}
+
+function isImportMap(value: unknown): value is ImportMap {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  return Object.values(value as Record<string, unknown>).every(
+    (entry) => typeof entry === "string",
+  );
 }

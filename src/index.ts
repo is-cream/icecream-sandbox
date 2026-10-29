@@ -10,6 +10,14 @@
  *   sandbox.dispose();
  */
 export { Sandbox, type SandboxOptions } from "./host.js";
+export {
+  ImportCache,
+  isModuleCode,
+  resolveSpecifier,
+  scanModuleSpecifiers,
+  validateImportMap,
+  type ImportMap,
+} from "./imports.js";
 export { DEFAULT_LIMITS, MAX_STACK_SIZE, resolveLimits, type ResolvedLimits, type RunLimits } from "./limits.js";
 export type { AskHandler, SessionEvent } from "./session.js";
 export {

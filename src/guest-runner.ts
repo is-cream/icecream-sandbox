@@ -34,6 +34,12 @@ import {
   type WorkerToHostMessage,
 } from "./protocol.js";
 import type { ResolvedLimits } from "./limits.js";
+import {
+  isModuleCode,
+  resolveSpecifier,
+  scanModuleSpecifiers,
+  type ImportMap,
+} from "./imports.js";
 
 const ERROR_TEXT_CAP = 4096;
 
@@ -55,6 +61,12 @@ interface ActiveRun {
   outputBytes: number;
   pendingAsks: Map<number, QuickJSDeferredPromise>;
   pendingFetches: Map<number, QuickJSDeferredPromise>;
+  /**
+   * Import fetches outstanding during the pre-evaluation import
+   * resolution. Plain JS promises (no QuickJS handles), so teardown
+   * only rejects them — nothing to dispose.
+   */
+  pendingImports: Map<number, { resolve: (value: string) => void; reject: (error: Error) => void }>;
   wakeResolvers: Array<() => void>;
   /**
    * True once the pump loop's finally has run (and disposed the completion
@@ -72,6 +84,7 @@ export class GuestRunner {
   private active: ActiveRun | null = null;
   private nextAskId = 1;
   private nextFetchId = 1;
+  private nextImportId = 1;
   private runsCompleted = 0;
   private disposed = false;
   private readonly textEncoder = new TextEncoder();
@@ -111,7 +124,7 @@ export class GuestRunner {
     if (message === null) return;
     switch (message.t) {
       case "run":
-        void this.startRun(message.id, message.code, message.limits);
+        void this.startRun(message.id, message.code, message.limits, message.imports);
         return;
       case "send":
         this.deliver(message.message);
@@ -127,6 +140,12 @@ export class GuestRunner {
         return;
       case "connection-error":
         this.settleFetch(message.id, false, message.error);
+        return;
+      case "import-result":
+        this.settleImport(message.id, true, message.value);
+        return;
+      case "import-error":
+        this.settleImport(message.id, false, message.error);
         return;
       case "dispose":
         this.dispose();
@@ -147,7 +166,12 @@ export class GuestRunner {
 
   // ---------------------------------------------------------------- run ---
 
-  private async startRun(id: number, code: string, limits: ResolvedLimits): Promise<void> {
+  private async startRun(
+    id: number,
+    code: string,
+    limits: ResolvedLimits,
+    imports: ImportMap,
+  ): Promise<void> {
     if (this.active !== null) {
       this.reply({ t: "error", id, error: "a run is already active in this worker" });
       return;
@@ -166,6 +190,7 @@ export class GuestRunner {
       outputBytes: 0,
       pendingAsks: new Map(),
       pendingFetches: new Map(),
+      pendingImports: new Map(),
       wakeResolvers: [],
       pumpExited: false,
       resourcesDisposed: false,
@@ -176,7 +201,16 @@ export class GuestRunner {
       runtime.setMaxStackSize(limits.maxStackSize);
       runtime.setInterruptHandler(shouldInterruptAfterDeadline(run.deadlineAt));
       this.installHost(run);
-      const result = await this.evalAndPump(run, code);
+      // Module runs pre-fetch the whole static import graph before
+      // evaluating anything (see imports.ts for why). Classic scripts
+      // skip this entirely and behave exactly as before.
+      const moduleSetup = isModuleCode(code)
+        ? {
+            modules: await this.prefetchImports(run, code, imports),
+            importMap: imports,
+          }
+        : null;
+      const result = await this.evalAndPump(run, code, moduleSetup);
       this.accountOutput(run, result);
       this.reply({ t: "result", id, value: result });
     } catch (error) {
@@ -186,12 +220,79 @@ export class GuestRunner {
     }
   }
 
+  /**
+   * Resolve and download the static import graph for one module run.
+   * Breadth-first from the entry code: each specifier resolves (import
+   * map or relative to its importing module's URL) and is fetched once
+   * from the host, which routes the download through the connection
+   * gate — so the first download from an origin prompts, a granted
+   * origin downloads silently, and the host-side cache means a second
+   * run never downloads it again. Bounded by maxImportModules,
+   * maxImportDepth, and the run deadline; any failure names the
+   * specifier and fails the run before anything evaluates.
+   */
+  private async prefetchImports(
+    run: ActiveRun,
+    code: string,
+    importMap: ImportMap,
+  ): Promise<Map<string, string>> {
+    const modules = new Map<string, string>();
+    const queue: Array<{ specifier: string; base: string | null; depth: number }> =
+      scanModuleSpecifiers(code).map((specifier) => ({ specifier, base: null, depth: 0 }));
+    const seen = new Set<string>();
+    while (queue.length > 0) {
+      const item = queue.shift();
+      if (item === undefined) break;
+      if (item.depth > run.limits.maxImportDepth) {
+        throw new Error("guest exceeded maxImportDepth");
+      }
+      if (Date.now() > run.deadlineAt) {
+        throw new Error("run deadline exceeded while fetching imports");
+      }
+      const url = resolveSpecifier(item.specifier, item.base, importMap);
+      if (seen.has(url)) continue;
+      seen.add(url);
+      if (modules.size >= run.limits.maxImportModules) {
+        throw new Error("guest exceeded maxImportModules");
+      }
+      const source = await this.requestImport(run, url);
+      modules.set(url, source);
+      for (const specifier of scanModuleSpecifiers(source)) {
+        queue.push({ specifier, base: url, depth: item.depth + 1 });
+      }
+    }
+    return modules;
+  }
+
+  private requestImport(run: ActiveRun, url: string): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      const id = this.nextImportId;
+      this.nextImportId += 1;
+      run.pendingImports.set(id, { resolve, reject });
+      this.reply({ t: "import-request", id, url });
+    });
+  }
+
+  private settleImport(id: number, ok: boolean, value: string): void {
+    const run = this.active;
+    if (run === null) return;
+    const pending = run.pendingImports.get(id);
+    if (pending === undefined) return;
+    run.pendingImports.delete(id);
+    if (ok) pending.resolve(value);
+    else pending.reject(new Error(value));
+  }
+
   private teardownRun(run: ActiveRun): void {
     // Reject anything still outstanding so no deferred survives the run.
     this.rejectPending(run, run.pendingAsks);
     this.rejectPending(run, run.pendingFetches);
     run.pendingAsks.clear();
     run.pendingFetches.clear();
+    for (const pending of run.pendingImports.values()) {
+      pending.reject(new Error("run ended before the host answered the import"));
+    }
+    run.pendingImports.clear();
     // Clear active FIRST and wake the pump loop, so it sees the run is
     // gone and throws "run aborted" instead of touching a disposed runtime.
     if (this.active === run) this.active = null;
@@ -472,9 +573,41 @@ export class GuestRunner {
 
   // ------------------------------------------------------------ pumping ---
 
-  private async evalAndPump(run: ActiveRun, code: string): Promise<string> {
+  private async evalAndPump(
+    run: ActiveRun,
+    code: string,
+    moduleSetup: { modules: Map<string, string>; importMap: ImportMap } | null,
+  ): Promise<string> {
     const vm = run.context;
-    const result = vm.evalCode(code, "guest.js");
+    if (moduleSetup !== null) {
+      // Real QuickJS module semantics, with the pre-fetched map as the
+      // only source of truth. The normalizer canonicalizes every
+      // specifier (import map for bare names, URL resolution for
+      // relatives); the loader serves pre-fetched sources. A specifier
+      // the prefetch never saw fails here with its name attached —
+      // never silently, never with a fetch the gate did not approve.
+      run.runtime.setModuleLoader(
+        (normalizedName: string) => {
+          const source = moduleSetup.modules.get(normalizedName);
+          if (source === undefined) {
+            return { error: new Error(`module not prefetched: ${normalizedName}`) };
+          }
+          return source;
+        },
+        (baseModuleName: string, requestedName: string) => {
+          const base = /^https?:\/\//.test(baseModuleName) ? baseModuleName : null;
+          try {
+            return resolveSpecifier(requestedName, base, moduleSetup.importMap);
+          } catch (error) {
+            return { error: error instanceof Error ? error : new Error(String(error)) };
+          }
+        },
+      );
+    }
+    const result =
+      moduleSetup !== null
+        ? vm.evalCode(code, "guest.js", { type: "module" })
+        : vm.evalCode(code, "guest.js");
     if (result.error) {
       const text = this.renderError(vm, result.error);
       result.error.dispose();
@@ -495,6 +628,16 @@ export class GuestRunner {
           // handle — the outer finally disposes it, so do not dispose twice.
           const isCompletion = state.notAPromise === true;
           try {
+            // A module's job is its side effects (host.send calls, event
+            // handlers); its namespace is not a result. A module that
+            // finishes synchronously resolves to "" — a top-level await
+            // that fulfills with a string is the only way a module run
+            // returns a value, mirroring the classic-script rule.
+            if (moduleSetup !== null) {
+              if (isCompletion) return "";
+              if (vm.typeof(value) !== "string") return "";
+              return vm.getString(value);
+            }
             if (vm.typeof(value) !== "string") {
               throw new Error("guest result must be a string");
             }
