@@ -1,4 +1,4 @@
-# browser-sandbox: threat model
+# icecream-sandbox: threat model
 
 A formal statement of what is protected, from whom, where the trust
 boundaries are, and what is explicitly out of scope. The companion

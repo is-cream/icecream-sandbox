@@ -1,4 +1,4 @@
-# browser-sandbox: threats and tests
+# icecream-sandbox: threats and tests
 
 Every threat the library defends against, the attack it would take,
 the mechanism that stops it, and the test that proves it. The formal

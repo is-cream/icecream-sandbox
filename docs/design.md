@@ -1,4 +1,4 @@
-# browser-sandbox: design
+# icecream-sandbox: design
 
 How the library works, flow by flow. Each section has a diagram and the
 reasoning behind it. If a diagram and the code ever disagree, the code

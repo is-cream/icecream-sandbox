@@ -1,4 +1,4 @@
-// Demo server for browser-sandbox.
+// Demo server for icecream-sandbox.
 //
 // Serves:
 //   /             -> demo/demo.html (the host page, no sandbox headers)
@@ -120,5 +120,5 @@ const server = createServer((req, res) => {
 });
 
 server.listen(port, () => {
-  console.log(`browser-sandbox demo at http://localhost:${port}/`);
+  console.log(`icecream-sandbox demo at http://localhost:${port}/`);
 });

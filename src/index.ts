@@ -1,10 +1,10 @@
 /**
- * browser-sandbox — public host-side API.
+ * icecream-sandbox — public host-side API.
  *
  * Serve dist/iframe.html from your own origin with the CSP and
  * Permissions-Policy in the README, then:
  *
- *   import { Sandbox } from "browser-sandbox";
+ *   import { Sandbox } from "icecream-sandbox";
  *   const sandbox = await Sandbox.create({ iframeUrl: "/sandbox/iframe.html" });
  *   const result = await sandbox.run(`host.send("hello"); "done"`);
  *   sandbox.dispose();

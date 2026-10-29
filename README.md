@@ -1,4 +1,4 @@
-# browser-sandbox
+# icecream-sandbox
 
 Run untrusted JavaScript in the browser, isolated in layers:
 
@@ -69,7 +69,7 @@ variant embeds its WASM as base64, so nothing is fetched at runtime).
 ## Quick start
 
 ```ts
-import { Sandbox } from "browser-sandbox";
+import { Sandbox } from "icecream-sandbox";
 
 // 1. Serve dist/iframe.html from your server with the headers below.
 const sandbox = await Sandbox.create({ iframeUrl: "/iframe.html" });

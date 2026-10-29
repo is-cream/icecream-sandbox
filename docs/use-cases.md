@@ -1,4 +1,4 @@
-# browser-sandbox: use cases
+# icecream-sandbox: use cases
 
 Who this library is for, what each use case looks like in code, and
 where the edges are. All sketches use the public API from the README;
@@ -262,7 +262,7 @@ radius of a bad policy is one string result and one error, not host
 compromise. Review for correctness, not for escape, because escape
 is what the sandbox removes.
 
-## What browser-sandbox is not
+## What icecream-sandbox is not
 
 - **Not a DOM sandbox for arbitrary web pages.** A guest HTML page
   with real DOM APIs is a different product with a different threat

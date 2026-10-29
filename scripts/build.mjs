@@ -67,7 +67,7 @@ const iframeHtml = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>browser-sandbox iframe</title>
+<title>icecream-sandbox iframe</title>
 <!--
   Served with: sandbox="allow-scripts" on the <iframe> element, plus the
   CSP and Permissions-Policy in the README. This document must stay
