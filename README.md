@@ -674,4 +674,4 @@ dynamically from the request's Host header.
 PolyForm Noncommercial 1.0.0 — see [LICENSE](LICENSE). Free for any
 noncommercial use (personal, hobby, study, research, charities, schools,
 government). Any commercial use requires a separate commercial license
-from the licensor — contact via https://github.com/is-cream.
+from the licensor — contact via https://deb0.com.
