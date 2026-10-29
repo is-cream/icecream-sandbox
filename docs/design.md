@@ -168,6 +168,46 @@ Rules:
   `maxOutstandingFetches` 4) and separate pending maps, so a stuck
   fetch cannot starve asks or vice versa.
 
+## Transparent bridging (host ↔ guest)
+
+```mermaid
+sequenceDiagram
+    participant Host as Host page
+    participant Worker as Worker
+    participant Guest as Guest code
+    Note over Host,Guest: create: host declares globals + guestFunctions
+    Host->>Worker: run (bridge spec, guestFunctions allowlist)
+    Worker->>Guest: install alert, localStorage, ... as globals
+    Guest->>Worker: localStorage.setItem("k", "v")
+    Worker->>Host: bridge-call (path, JSON args)
+    Host->>Host: look up path in host config (own props only)
+    Host->>Worker: bridge-result (JSON value) or bridge-error
+    Worker->>Guest: await resolves with the value (not JSON text)
+    Host->>Worker: invoke-guest ("widgets.counter", arg)
+    Worker->>Worker: allowlist check → own-prop path walk → call with parent as this
+    Worker->>Host: invoke-result (string) or invoke-error
+```
+
+Rules:
+
+- The host's `globals` config is validated at `create` time; the
+  worker receives only the shape-only spec, never host code or
+  functions.
+- Bridged calls are async by physics — the guest always gets a
+  promise. Arguments and return values are JSON; anything else fails
+  loudly in the guest. A host function returning `undefined`
+  resolves the guest's await with `null`.
+- A name the host did not configure does not exist in the guest
+  realm (`ReferenceError`, fail closed).
+- Host→guest invocation resolves dotted paths through own
+  properties only (no prototype chain), calls the function with its
+  parent as `this`, and requires a string result. Async guest
+  functions are settled by the pump loop and bounded by the run
+  deadline; if the run ends first, the host's promise rejects.
+- Only `globalThis` properties are reachable from the host:
+  top-level `function` declarations in classic scripts qualify;
+  `const`/`let` and module-scope bindings do not.
+
 ## Connection gate
 
 The guest's only network path. Everything else on this page is

@@ -17,13 +17,21 @@
  * iframe to terminate the worker and the next run() rebuilds a fresh session
  * over a fresh channel and worker. A failed session is never reused.
  */
-import { Session, type AskHandler, type SessionEvent } from "./session.js";
+import { Session, type AskHandler, type BridgeHandler, type SessionEvent } from "./session.js";
 import { DEFAULT_LIMITS, type RunLimits } from "./limits.js";
 import {
   ConnectionGate,
   type ConnectionApprovalHandler,
 } from "./connections.js";
 import { ImportCache, type ImportMap } from "./imports.js";
+import {
+  normalizeBridgeGlobals,
+  validateGuestFunctions,
+  type BridgeFunction,
+  type BridgeGlobals,
+  type BridgeSpec,
+  type JsonValue,
+} from "./bridge.js";
 
 export interface SandboxOptions {
   /** URL of the served iframe document (dist/iframe.html). Required. */
@@ -57,6 +65,27 @@ export interface SandboxOptions {
   maxConnectionResponseBytes?: number;
   /** Per-connection timeout in milliseconds. Default 10000. */
   connectionTimeoutMs?: number;
+  /**
+   * Transparent globals the guest may call like normal APIs —
+   * alert("hi"), localStorage.setItem("k", "v") — without knowing any
+   * sandbox-specific `host.` object. Each function here becomes a
+   * global in the guest realm; each call crosses to the host, which
+   * runs this implementation and returns the result. Nested objects
+   * become namespaces (e.g. `localStorage: { getItem, setItem }`).
+   * A name not listed here simply does not exist in the guest realm
+   * (ReferenceError, fail closed). Calls are async by physics — the
+   * guest always gets a promise back, so LLM-generated code should
+   * await them. See bridge.ts.
+   */
+  globals?: BridgeGlobals;
+  /**
+   * Allowlist of guest globals the host may call with
+   * sandbox.invoke("a.b.c", arg) — dotted paths into plain guest
+   * functions or methods on guest objects. The guest defines them
+   * normally; no registration call is needed on the guest side, and
+   * the guest cannot expand this list. Default: none.
+   */
+  guestFunctions?: string[];
 }
 
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10000;
@@ -95,10 +124,21 @@ export class Sandbox {
   private messageListeners = new Set<(message: string) => void>();
   private errorListeners = new Set<(error: string) => void>();
   private askHandlers = new Map<string, AskHandler>();
+  /** Shape-only spec of the configured globals (worker never sees host code). */
+  private readonly bridgeSpec: BridgeSpec;
+  /** Dotted paths the host may invoke on the guest. */
+  private readonly guestFunctions: string[];
 
-  private constructor(options: SandboxOptions, doc: Document) {
+  private constructor(
+    options: SandboxOptions,
+    doc: Document,
+    bridgeSpec: BridgeSpec,
+    guestFunctions: string[],
+  ) {
     this.options = options;
     this.doc = doc;
+    this.bridgeSpec = bridgeSpec;
+    this.guestFunctions = guestFunctions;
     // The gate lives on the Sandbox, not on a session: session grants
     // survive worker rebuilds (a watchdog kill must not re-prompt the
     // user for an origin they already approved), and die on dispose().
@@ -119,7 +159,11 @@ export class Sandbox {
       throw new Error("create: iframeUrl is required (serve dist/iframe.html and pass its URL)");
     }
     const doc = options.document ?? globalThis.document;
-    const sandbox = new Sandbox(options, doc);
+    // Validate the bridge config now: a bad mapping must fail at
+    // create time, never mid-run inside the sandbox.
+    const bridgeSpec = normalizeBridgeGlobals(options.globals);
+    const guestFunctions = validateGuestFunctions(options.guestFunctions);
+    const sandbox = new Sandbox(options, doc, bridgeSpec, guestFunctions);
     await sandbox.buildSession();
     return sandbox;
   }
@@ -170,6 +214,22 @@ export class Sandbox {
       throw new Error("sandbox has no live session; call run() first to rebuild it");
     }
     this.session.send(message);
+  }
+
+  /**
+   * Call a guest function by dotted path — host -> guest. The guest
+   * just defines a normal global (`function render(d) {...}` or
+   * `const app = { render(d) {...} }`); no guest-side registration
+   * call is needed. Only paths in the create-time `guestFunctions`
+   * allowlist resolve; the path walks own properties only, the final
+   * value must be a function, and it is called with its parent object
+   * as `this`. The guest function receives one string argument and
+   * must return a string (sync or async — an async one is bounded by
+   * the in-flight run's deadline).
+   */
+  invoke(name: string, arg = ""): Promise<string> {
+    if (this.disposed) return Promise.reject(new Error("sandbox is disposed"));
+    return this.withSession(async (session) => session.invoke(name, arg));
   }
 
   on(event: SessionEvent, callback: (value: string) => void): () => void {
@@ -228,6 +288,36 @@ export class Sandbox {
 
   // ------------------------------------------------------------- internals ---
 
+  /**
+   * Dispatch one guest call of a bridged global into the host's
+   * `globals` config. The path is looked up through own properties
+   * only — the worker only ever sends configured paths, but the
+   * dispatcher never trusts that.
+   */
+  private makeBridgeDispatcher(): BridgeHandler {
+    const globals: Record<string, unknown> = (this.options.globals ?? {}) as Record<
+      string,
+      unknown
+    >;
+    return async (path: string, args: JsonValue[]): Promise<JsonValue> => {
+      let node: unknown = globals;
+      for (const segment of path.split(".")) {
+        if (
+          typeof node !== "object" ||
+          node === null ||
+          !Object.prototype.hasOwnProperty.call(node, segment)
+        ) {
+          throw new Error(`bridge call "${path}" is not configured`);
+        }
+        node = (node as Record<string, unknown>)[segment];
+      }
+      if (typeof node !== "function") {
+        throw new Error(`bridge call "${path}" is not configured`);
+      }
+      return (node as BridgeFunction)(...args);
+    };
+  }
+
   private mergeLimits(limits?: RunLimits): RunLimits {
     return { ...this.options.defaultLimits, ...limits };
   }
@@ -275,6 +365,8 @@ export class Sandbox {
       maxInboundBytes: maxInbound,
       expectedNonce: this.nonce,
       maxMessageSize: this.options.defaultLimits?.maxMessageSize ?? DEFAULT_LIMITS.maxMessageSize,
+      bridgeSpec: this.bridgeSpec,
+      guestFunctions: this.guestFunctions,
     });
     session.onFatal = () => {
       this.sessionFailed = true;
@@ -283,6 +375,10 @@ export class Sandbox {
       // permanently dead sandbox.
       this.terminateWorker();
     };
+    // Bridged-global calls dispatch into the host's `globals` config
+    // (bridge.ts). The dispatcher lives on the Sandbox so it survives
+    // session rebuilds, like the connection gate.
+    session.onBridgeRequest = this.makeBridgeDispatcher();
     // Connection requests route to the gate, which lives on the Sandbox so
     // grants survive this session's rebuilds.
     session.onConnectionRequest = (url) => this.gate.fetchText(url);
@@ -364,3 +460,9 @@ export type {
   ConnectionApprovalRequest,
   ConnectionDecision,
 } from "./connections.js";
+export type {
+  BridgeFunction,
+  BridgeGlobals,
+  BridgeObject,
+  JsonValue,
+} from "./bridge.js";

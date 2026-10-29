@@ -1,6 +1,6 @@
 {
   "name": "icecream-sandbox",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Run untrusted JavaScript in the browser inside QuickJS (WebAssembly) in a Web Worker inside a sandboxed iframe. No network, no DOM, no storage for guest code.",
   "license": "PolyForm-Noncommercial-1.0.0",
   "type": "module",
@@ -37,5 +37,23 @@
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/is-cream/icecream-sandbox.git"
+  },
+  "homepage": "https://github.com/is-cream/icecream-sandbox#readme",
+  "bugs": {
+    "url": "https://github.com/is-cream/icecream-sandbox/issues"
+  },
+  "keywords": [
+    "sandbox",
+    "quickjs",
+    "web-worker",
+    "iframe",
+    "untrusted-code",
+    "vm",
+    "plugin",
+    "llm"
+  ]
 }

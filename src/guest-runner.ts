@@ -11,6 +11,10 @@
  * see connections.ts; the guest itself has no network capability), and
  * `host.importModule(name) -> Promise<namespace>` (a gated, cached
  * dynamic import for computed specifiers — see imports.ts).
+ * On top of that, the host may configure transparent bridged globals
+ * (bridge.ts): plain names like alert() or localStorage.setItem() that
+ * the guest calls normally, each call forwarded to the host. A name the
+ * host did not configure simply does not exist in the guest realm.
  * Everything else — fetch, XHR, WebSocket, timers, process, require, DOM —
  * simply does not exist in a QuickJS context, because nothing puts it there.
  *
@@ -43,6 +47,7 @@ import {
   scanModuleSpecifiers,
   type ImportMap,
 } from "./imports.js";
+import type { BridgeSpec, JsonValue } from "./bridge.js";
 
 const ERROR_TEXT_CAP = 4096;
 
@@ -83,6 +88,26 @@ interface ActiveRun {
    * the run's main completion (their jobs share the same queue).
    */
   pendingModuleEvals: Array<{ promise: QuickJSHandle; deferred: QuickJSDeferredPromise }>;
+  /**
+   * Host-configured transparent globals (bridge.ts): the shape-only
+   * spec. The worker installs these names in the guest realm; each
+   * call crosses the port to the host's implementation.
+   */
+  bridge: BridgeSpec;
+  /**
+   * Host-defined allowlist of guest globals the host may invoke
+   * (dotted paths, e.g. "myApp.utils.format"). The guest cannot
+   * expand this list; invoke-guest for any other path is rejected.
+   */
+  guestFunctions: string[];
+  /** Bridged-global calls awaiting the host's answer. */
+  pendingBridges: Map<number, QuickJSDeferredPromise>;
+  /**
+   * Host-initiated guest invocations whose (possibly async) guest
+   * function has not settled yet. Settled by the pump loop, which
+   * replies invoke-result/invoke-error to the host.
+   */
+  pendingInvokes: Array<{ promise: QuickJSHandle; invokeId: number }>;
   wakeResolvers: Array<() => void>;
   /**
    * True once the pump loop's finally has run (and disposed the completion
@@ -101,6 +126,7 @@ export class GuestRunner {
   private nextAskId = 1;
   private nextFetchId = 1;
   private nextImportId = 1;
+  private nextBridgeId = 1;
   private runsCompleted = 0;
   private disposed = false;
   private readonly textEncoder = new TextEncoder();
@@ -140,7 +166,14 @@ export class GuestRunner {
     if (message === null) return;
     switch (message.t) {
       case "run":
-        void this.startRun(message.id, message.code, message.limits, message.imports);
+        void this.startRun(
+          message.id,
+          message.code,
+          message.limits,
+          message.imports,
+          message.bridge ?? {},
+          message.guestFunctions ?? [],
+        );
         return;
       case "send":
         this.deliver(message.message);
@@ -162,6 +195,15 @@ export class GuestRunner {
         return;
       case "import-error":
         this.settleImport(message.id, false, message.error);
+        return;
+      case "bridge-result":
+        this.settleBridge(message.id, true, message.value);
+        return;
+      case "bridge-error":
+        this.settleBridge(message.id, false, message.error);
+        return;
+      case "invoke-guest":
+        this.handleGuestInvoke(message.id, message.path, message.arg);
         return;
       case "dispose":
         this.dispose();
@@ -187,6 +229,8 @@ export class GuestRunner {
     code: string,
     limits: ResolvedLimits,
     imports: ImportMap,
+    bridge: BridgeSpec,
+    guestFunctions: string[],
   ): Promise<void> {
     if (this.active !== null) {
       this.reply({ t: "error", id, error: "a run is already active in this worker" });
@@ -211,6 +255,10 @@ export class GuestRunner {
       modules: new Map(),
       loaderInstalled: false,
       pendingModuleEvals: [],
+      bridge,
+      guestFunctions,
+      pendingBridges: new Map(),
+      pendingInvokes: [],
       wakeResolvers: [],
       pumpExited: false,
       resourcesDisposed: false,
@@ -221,6 +269,7 @@ export class GuestRunner {
       runtime.setMaxStackSize(limits.maxStackSize);
       runtime.setInterruptHandler(shouldInterruptAfterDeadline(run.deadlineAt));
       this.installHost(run);
+      this.installBridgedGlobals(run);
       // The import graph is pre-fetched before evaluation: static
       // imports AND string-literal dynamic imports (see imports.ts for
       // why the loader must be fed up front). A classic script that
@@ -385,6 +434,373 @@ export class GuestRunner {
     else pending.reject(new Error(value));
   }
 
+  // ------------------------------------------------- bridged globals ---
+
+  /**
+   * Install the host-configured transparent globals (bridge.ts) in the
+   * guest realm. Each leaf becomes a function the guest calls like any
+   * normal API — alert("hi"), localStorage.setItem("k", "v") — and each
+   * call crosses the port to the host's implementation. A name the host
+   * did not configure is simply absent (ReferenceError, fail closed).
+   */
+  private installBridgedGlobals(run: ActiveRun): void {
+    const vm = run.context;
+    if (Object.keys(run.bridge).length === 0) return;
+    Scope.withScope((scope) => {
+      for (const [name, spec] of Object.entries(run.bridge)) {
+        const value = scope.manage(this.makeBridgeValue(run, [name], spec));
+        vm.setProp(vm.global, name, value);
+      }
+    });
+  }
+
+  private makeBridgeValue(
+    run: ActiveRun,
+    path: string[],
+    spec: "function" | BridgeSpec,
+  ): QuickJSHandle {
+    const vm = run.context;
+    if (spec === "function") {
+      // The callback's args are borrowed handles (never freed here);
+      // the returned promise handle is owned by the deferred and
+      // disposed when the bridge settles.
+      return vm.newFunction(path.join("."), (...args: QuickJSHandle[]) =>
+        this.guestBridgeCall(run, path, args),
+      );
+    }
+    const obj = vm.newObject();
+    for (const [key, child] of Object.entries(spec)) {
+      const childHandle = this.makeBridgeValue(run, [...path, key], child);
+      try {
+        vm.setProp(obj, key, childHandle);
+      } finally {
+        childHandle.dispose();
+      }
+    }
+    return obj;
+  }
+
+  /**
+   * One guest call of a bridged global. Arguments are dumped to JSON
+   * (anything not JSON-serializable fails loudly in the guest); the
+   * host answers with a JSON value that becomes the awaited result.
+   * Bridged calls are async by physics — they cross the worker
+   * boundary — so the guest always gets a promise back.
+   */
+  private guestBridgeCall(
+    run: ActiveRun,
+    path: string[],
+    args: QuickJSHandle[],
+  ): QuickJSHandle {
+    const vm = run.context;
+    let argsJson: string;
+    try {
+      argsJson = JSON.stringify(args.map((arg) => vm.dump(arg)));
+    } catch {
+      throw new Error(
+        `bridge call "${path.join(".")}": arguments must be JSON-serializable`,
+      );
+    }
+    if (run.pendingBridges.size >= run.limits.maxOutstandingAsks) {
+      throw new Error(`bridge call "${path.join(".")}": too many outstanding bridge calls`);
+    }
+    const deferred = vm.newPromise();
+    const bridgeId = this.nextBridgeId;
+    this.nextBridgeId += 1;
+    run.pendingBridges.set(bridgeId, deferred);
+    this.reply({ t: "bridge-call", id: bridgeId, path: path.join("."), args: argsJson });
+    return deferred.handle;
+  }
+
+  private settleBridge(id: number, ok: boolean, value: string): void {
+    const run = this.active;
+    if (run === null) return;
+    const deferred = run.pendingBridges.get(id);
+    if (deferred === undefined) return;
+    run.pendingBridges.delete(id);
+    const vm = run.context;
+    try {
+      if (!ok) {
+        const reason = vm.newString(value);
+        try {
+          deferred.reject(reason);
+        } finally {
+          reason.dispose();
+        }
+        return;
+      }
+      // The host answers with JSON; the guest awaits the real value,
+      // not the JSON text. A host function returning undefined arrives
+      // as null (see bridge.ts).
+      const parsed: unknown = JSON.parse(value);
+      const handle = this.jsonToHandle(vm, parsed);
+      try {
+        deferred.resolve(handle);
+      } finally {
+        handle.dispose();
+      }
+    } catch (error) {
+      try {
+        const reason = vm.newString(errorText(error));
+        try {
+          deferred.reject(reason);
+        } finally {
+          reason.dispose();
+        }
+      } catch {
+        // The runtime may be mid-teardown; the pump loop will surface it.
+      }
+    } finally {
+      try {
+        deferred.dispose();
+      } catch {
+        // ignore
+      }
+    }
+    this.wake(run);
+  }
+
+  /** Build a QuickJS value from parsed JSON. Only JSON shapes arrive here. */
+  private jsonToHandle(vm: QuickJSContext, value: unknown): QuickJSHandle {
+    if (value === null) return vm.null;
+    if (value === undefined) return vm.undefined;
+    switch (typeof value) {
+      case "string":
+        return vm.newString(value);
+      case "number":
+        return vm.newNumber(value);
+      case "boolean":
+        return value ? vm.true : vm.false;
+      case "object": {
+        if (Array.isArray(value)) {
+          const arr = vm.newArray();
+          try {
+            let index = 0;
+            for (const entry of value) {
+              const entryHandle = this.jsonToHandle(vm, entry);
+              try {
+                vm.setProp(arr, String(index), entryHandle);
+              } finally {
+                entryHandle.dispose();
+              }
+              index++;
+            }
+          } catch (error) {
+            arr.dispose();
+            throw error;
+          }
+          return arr;
+        }
+        const obj = vm.newObject();
+        try {
+          for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+            const entryHandle = this.jsonToHandle(vm, entry);
+            try {
+              vm.setProp(obj, key, entryHandle);
+            } finally {
+              entryHandle.dispose();
+            }
+          }
+        } catch (error) {
+          obj.dispose();
+          throw error;
+        }
+        return obj;
+      }
+      default:
+        throw new Error("bridge result is not JSON-serializable");
+    }
+  }
+
+  // ------------------------------------------------- guest invocation ---
+
+  /**
+   * Handle one host->guest invocation. The path must be in the host's
+   * allowlist (the guest cannot expand it); it resolves through own
+   * properties only — never the prototype chain — and the final value
+   * must be a function, called with its parent object as `this`. A
+   * synchronous function replies immediately; an async one is settled
+   * by the pump loop, which also bounds it by the run deadline.
+   */
+  private handleGuestInvoke(id: number, path: string, arg: string): void {
+    const run = this.active;
+    if (run === null) {
+      this.reply({ t: "invoke-error", id, error: "no active run to invoke a guest function on" });
+      return;
+    }
+    const vm = run.context;
+    try {
+      if (!run.guestFunctions.includes(path)) {
+        throw new Error(`guest function "${path}" is not allowed`);
+      }
+      const resolved = this.resolveGuestPath(vm, path);
+      try {
+        const argHandle = vm.newString(arg);
+        try {
+          const call = vm.callFunction(resolved.func, resolved.thisArg, argHandle);
+          if (call.error) {
+            const text = this.renderError(vm, call.error);
+            call.error.dispose();
+            throw new Error(text);
+          }
+          const completion = call.value;
+          const state = vm.getPromiseState(completion);
+          if (state.type === "fulfilled" && state.notAPromise === true) {
+            // Synchronous guest function: the result must be a string,
+            // like every other guest->host value on the wire.
+            try {
+              if (vm.typeof(completion) !== "string") {
+                throw new Error("guest function must return a string");
+              }
+              this.reply({ t: "invoke-result", id, value: vm.getString(completion) });
+            } finally {
+              completion.dispose();
+            }
+            return;
+          }
+          if (state.type === "rejected") {
+            const text = this.renderError(vm, state.error);
+            state.error.dispose();
+            completion.dispose();
+            throw new Error(text);
+          }
+          // Async guest function: the pump loop settles it (and bounds it
+          // by the run deadline like everything else).
+          run.pendingInvokes.push({ promise: completion, invokeId: id });
+          this.wake(run);
+        } finally {
+          argHandle.dispose();
+        }
+      } finally {
+        resolved.func.dispose();
+        resolved.thisArg.dispose();
+      }
+    } catch (error) {
+      this.reply({ t: "invoke-error", id, error: errorText(error) });
+    }
+  }
+
+  /**
+   * Resolve a dotted path from the guest global, through own
+   * properties only. Prototype-chain traversal (constructor,
+   * __proto__, ...) cannot resolve: each step must be an own
+   * property of the previous object.
+   */
+  private resolveGuestPath(
+    vm: QuickJSContext,
+    path: string,
+  ): { func: QuickJSHandle; thisArg: QuickJSHandle } {
+    const segments = path.split(".");
+    let obj: QuickJSHandle = vm.global;
+    try {
+      for (let i = 0; i < segments.length; i++) {
+        const key = segments[i] as string;
+        if (!this.hasOwn(vm, obj, key)) {
+          throw new Error(`guest function "${path}" does not exist`);
+        }
+        const next = vm.getProp(obj, key);
+        if (i === segments.length - 1) {
+          if (vm.typeof(next) !== "function") {
+            next.dispose();
+            throw new Error(`guest function "${path}" is not a function`);
+          }
+          return { func: next, thisArg: obj };
+        }
+        const type = vm.typeof(next);
+        if (type !== "object" && type !== "function") {
+          next.dispose();
+          throw new Error(`guest function "${path}" does not exist`);
+        }
+        if (vm.dump(next) === null) {
+          // typeof null is "object"; catch it before the next step.
+          next.dispose();
+          throw new Error(`guest function "${path}" does not exist`);
+        }
+        obj.dispose();
+        obj = next;
+      }
+      throw new Error(`guest function "${path}" does not exist`);
+    } catch (error) {
+      obj.dispose();
+      throw error;
+    }
+  }
+
+  /** Own-property check via Object.prototype.hasOwnProperty. */
+  private hasOwn(vm: QuickJSContext, obj: QuickJSHandle, key: string): boolean {
+    return Scope.withScope((scope) => {
+      const Object_ = scope.manage(vm.getProp(vm.global, "Object"));
+      const proto = scope.manage(vm.getProp(Object_, "prototype"));
+      const hasOwnProp = scope.manage(vm.getProp(proto, "hasOwnProperty"));
+      const keyHandle = scope.manage(vm.newString(key));
+      const result = vm.callFunction(hasOwnProp, obj, keyHandle);
+      if (result.error) {
+        const text = this.renderError(vm, result.error);
+        result.error.dispose();
+        throw new Error(text);
+      }
+      const out = vm.dump(result.value);
+      result.value.dispose();
+      return out === true;
+    });
+  }
+
+  /**
+   * Settle host-initiated guest invocations whose async function
+   * finished. Called each pump-loop iteration; replies invoke-result
+   * (string results only, like every guest->host value) or
+   * invoke-error. A run that dies with invokes outstanding leaves
+   * them to teardown; the session rejects the host's promises.
+   */
+  private settleInvokes(run: ActiveRun): void {
+    const vm = run.context;
+    const remaining: typeof run.pendingInvokes = [];
+    for (const entry of run.pendingInvokes) {
+      let state;
+      try {
+        state = vm.getPromiseState(entry.promise);
+      } catch {
+        // Runtime mid-teardown; teardownRun disposes these.
+        remaining.push(entry);
+        continue;
+      }
+      if (state.type === "pending") {
+        remaining.push(entry);
+        continue;
+      }
+      try {
+        if (state.type === "fulfilled") {
+          const value = state.value;
+          try {
+            if (vm.typeof(value) !== "string") {
+              throw new Error("guest function must return a string");
+            }
+            this.reply({ t: "invoke-result", id: entry.invokeId, value: vm.getString(value) });
+          } finally {
+            value.dispose();
+          }
+        } else {
+          const text = this.renderError(vm, state.error);
+          try {
+            state.error.dispose();
+          } catch {
+            // ignore
+          }
+          this.reply({ t: "invoke-error", id: entry.invokeId, error: text });
+        }
+      } catch (error) {
+        this.reply({ t: "invoke-error", id: entry.invokeId, error: errorText(error) });
+      } finally {
+        try {
+          entry.promise.dispose();
+        } catch {
+          // ignore
+        }
+      }
+    }
+    run.pendingInvokes = remaining;
+  }
+
   private teardownRun(run: ActiveRun): void {
     // Reject anything still outstanding so no deferred survives the run.
     this.rejectPending(run, run.pendingAsks);
@@ -395,6 +811,18 @@ export class GuestRunner {
       pending.reject(new Error("run ended before the host answered the import"));
     }
     run.pendingImports.clear();
+    this.rejectPending(run, run.pendingBridges);
+    run.pendingBridges.clear();
+    for (const entry of run.pendingInvokes) {
+      // The run is gone; the host's invoke promise is rejected by the
+      // session on run end. Dispose the guest-side handles only.
+      try {
+        entry.promise.dispose();
+      } catch {
+        // ignore
+      }
+    }
+    run.pendingInvokes = [];
     for (const entry of run.pendingModuleEvals) {
       try {
         const reason = run.context.newString("run ended before the imported module settled");
@@ -898,6 +1326,10 @@ export class GuestRunner {
         // Settle any host.importModule top-level awaits before looking
         // at the main completion; their jobs share this queue.
         this.settleModuleEvals(run);
+        // Same for host-initiated guest invocations: their jobs share
+        // this queue, and the run deadline bounds them like everything
+        // else. Replies go straight to the host.
+        this.settleInvokes(run);
         const state = vm.getPromiseState(completion);
         if (state.type === "fulfilled") {
           const value = state.value;

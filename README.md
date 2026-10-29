@@ -9,17 +9,32 @@ host page
       → QuickJS compiled to WebAssembly      (guest code runs here)
 ```
 
-Guest code gets exactly one global, `host`, with three functions:
-`host.send(string)`, `host.ask(name, arg?)`, and the gated
-`host.fetchText(url)`. Everything else — network, DOM, storage,
-timers, Node APIs — is absent from the guest environment, and the
-layers around it would block network access even if a guest somehow
-reached a real `fetch`.
+Guest code gets exactly one global, `host`, with `host.send(string)`,
+`host.ask(name, arg?)`, the gated `host.fetchText(url)`, and
+`host.importModule(name)` — plus whatever transparent globals the host
+configures (see [Communication](#communication-host--guest)).
+Everything else — network, DOM, storage, timers, Node APIs — is absent
+from the guest environment, and the layers around it would block
+network access even if a guest somehow reached a real `fetch`.
 
 No telemetry. Two runtime dependencies, both pinned:
 `quickjs-emscripten-core@0.32.0` and
 `@jitl/quickjs-singlefile-cjs-release-sync@0.32.0` (the singlefile
 variant embeds its WASM as base64, so nothing is fetched at runtime).
+
+## Install
+
+```sh
+npm install icecream-sandbox
+```
+
+Then serve `dist/iframe.html` from your own origin (see
+[Serving the iframe document](#serving-the-iframe-document)) and:
+
+```ts
+import { Sandbox } from "icecream-sandbox";
+const sandbox = await Sandbox.create({ iframeUrl: "/iframe.html" });
+```
 
 ## Capabilities
 
@@ -38,6 +53,15 @@ variant embeds its WASM as base64, so nothing is fetched at runtime).
 - **Host function allowlist.** `registerAsk` exposes named host
   functions to `host.ask()`; unregistered names reject inside the
   guest. The guest reaches exactly what you register, nothing else.
+- **Transparent host bridging for generated code.** The host
+  declares plain globals the guest may call like normal APIs —
+  `alert("hi")`, `localStorage.setItem("k", "v")` — each call
+  forwarded to the host's implementation. LLM-generated guest code
+  needs no sandbox vocabulary. See
+  [Communication](#communication-host--guest).
+- **Host-to-guest function calls.** `sandbox.invoke("a.b.c", arg)`
+  calls a guest function by dotted path, gated by a host-defined
+  allowlist. See [Communication](#communication-host--guest).
 - **Human-in-the-loop gated connections.** `host.fetchText()` lets a
   guest app fetch outside data (a stylesheet from a CDN, for example)
   only after the host approves: a developer allowlist, per-origin
@@ -100,6 +124,130 @@ Guest code is a **classic script**: there is no top-level `await`.
 Async guests wrap their body in an async IIFE, as above; the runner
 awaits the returned promise.
 
+## Communication (host ↔ guest)
+
+Every way the two sides talk, in one place. The rule behind all of
+them: **the trusted host defines the entire interface.** The guest
+can never invent a capability the host did not configure, and
+anything unconfigured fails closed.
+
+### Guest → host
+
+**1. Transparent bridged globals (for generated code).** Guest code
+is often LLM-written: it calls plain APIs — `alert("hi")`,
+`localStorage.setItem("k", "v")` — and cannot know about any
+sandbox-specific `host.` object. So the host declares the guest's
+vocabulary up front, in `Sandbox.create`:
+
+```ts
+const sandbox = await Sandbox.create({
+  iframeUrl: "/iframe.html",
+  globals: {
+    alert: (message) => showToast(message),
+    localStorage: {
+      getItem: (k) => store[k] ?? null,
+      setItem: (k, v) => { store[k] = String(v); },
+      removeItem: (k) => { delete store[k]; },
+    },
+  },
+});
+```
+
+```js
+// Guest: plain code, no sandbox vocabulary.
+await alert("saved");
+await localStorage.setItem("theme", "dark");
+const theme = await localStorage.getItem("theme"); // "dark"
+```
+
+The worker installs each configured name in the guest realm; every
+call crosses to the host, which runs its implementation and returns
+the result. A name the host did not configure simply does not exist
+down there (`ReferenceError`). Rules:
+
+- Arguments and return values are **JSON** — anything else fails
+  loudly in the guest.
+- Calls are **async by physics** (they cross the worker boundary):
+  the guest always gets a promise back, so generated code must
+  `await` them. A host function returning `undefined` resolves the
+  guest's await with `null`.
+- The config is validated at `create` time — a bad mapping fails
+  before any guest code runs, never mid-run.
+
+**2. `host.send(string)` → `sandbox.on("message")`.** Fire-and-forget
+guest→host messages: UI trees, events, logs. Strings only.
+
+**3. `host.ask(name, arg?)` → `sandbox.registerAsk(name, handler)`.**
+Named host functions for hand-written guest code. `registerAsk` is
+an explicit allowlist; unregistered names reject in the guest.
+Handlers take one string and return one string (or a promise of
+one). The bridged globals above are the transparent counterpart
+for generated code; `ask` stays for code you write yourself.
+
+**4. `host.fetchText(url)`.** A gated host-side fetch (GET only,
+credentials omitted, redirects rejected, size-capped): developer
+allowlist → per-origin session grants → your approval callback.
+Absent a grant, it fails closed. See
+[Gated connections](#gated-connections-human-in-the-loop).
+
+**5. `host.importModule(name)`.** Gated, cached dynamic import of a
+real package through the same gate. See
+[Guest ES module imports](#guest-es-module-imports).
+
+### Host → guest
+
+**1. `sandbox.send(message)` → guest's `onMessage`.** Delivers a
+string to the in-flight run's `globalThis.onMessage(message)`.
+No-op when no run is in flight.
+
+**2. `sandbox.invoke("a.b.c", arg)` — calling guest functions.** The
+host calls a guest function by dotted path: top-level functions and
+methods on guest objects alike.
+
+```ts
+const sandbox = await Sandbox.create({
+  iframeUrl: "/iframe.html",
+  guestFunctions: ["renderCard", "widgets.counter"], // the allowlist
+});
+await sandbox.run(`... guest defines renderCard, widgets ...`);
+const html = await sandbox.invoke("renderCard", JSON.stringify(rows));
+```
+
+```js
+// Guest: just normal globals. No registration call needed.
+function renderCard(arg) { return buildCard(JSON.parse(arg)); }
+globalThis.widgets = {
+  count: 0,
+  counter(n) { this.count += 1; return "count=" + this.count + ":" + n; },
+};
+```
+
+Rules:
+
+- Only paths in the create-time `guestFunctions` allowlist resolve;
+  anything else rejects. The guest cannot expand the list.
+- The path resolves through **own properties only** — never the
+  prototype chain, so `constructor` / `__proto__` traversal cannot
+  resolve.
+- The final value must be a function; it is called with its parent
+  object as `this`, receives **one string argument**, and must
+  return a **string** (sync or async — an async one is bounded by
+  the in-flight run's deadline like everything else).
+- Only properties of `globalThis` are reachable: top-level
+  `function` declarations in classic scripts qualify automatically;
+  `const`/`let` bindings and module-scope declarations do not —
+  assign what the host may call to `globalThis`.
+- Invoking with no run in flight rejects; if the run ends first,
+  the promise rejects.
+
+### The LLM prompt contract
+
+When the guest is LLM-generated, the system prompt lists the
+available globals (`alert()`, `localStorage.*`, … — all async, await
+them) and the invokable entry points the host will call. Generate
+that list from the same `globals` / `guestFunctions` config so the
+prompt and the sandbox can never disagree.
+
 ### Serving the iframe document
 
 Serve `dist/iframe.html` with this CSP header (plus the
@@ -135,6 +283,8 @@ The demo server (`demo/demo-server.mjs`) shows the exact headers.
 | `onConnectionRequest` | (none) | Human-in-the-loop approval callback for guest connection requests (see below). Absent means deny. |
 | `maxConnectionResponseBytes` | 1 MiB | Max response body bytes returned to the guest per connection. A response must also fit `maxInboundBytes` to cross the port. |
 | `connectionTimeoutMs` | 10000 | Per-connection timeout. |
+| `globals` | (none) | Transparent globals the guest may call like normal APIs — e.g. `{ alert: fn, localStorage: { getItem: fn, setItem: fn } }`. Each call crosses to the host's implementation; unconfigured names do not exist in the guest realm. See [Communication](#communication-host--guest). |
+| `guestFunctions` | (none) | Allowlist of guest globals the host may call with `sandbox.invoke("a.b.c", arg)` — dotted paths. The guest defines them normally; it cannot expand this list. See [Communication](#communication-host--guest). |
 
 ### `sandbox.run(code, limits?, imports?)`
 
@@ -156,6 +306,15 @@ long-lived app. See
 Delivers a string to the guest. A guest that defines
 `globalThis.onMessage = (m) => { ... }` receives it. Non-strings throw
 synchronously.
+
+### `sandbox.invoke(name, arg?)`
+
+Calls a guest function by dotted path — host → guest. Only paths in
+the create-time `guestFunctions` allowlist resolve; the path walks
+own properties only; the final value must be a function, called with
+its parent as `this`, receiving one string and returning a string.
+Rejects when no run is in flight or the run ends first. See
+[Communication](#communication-host--guest).
 
 ### `sandbox.on("message" | "error", handler)`
 

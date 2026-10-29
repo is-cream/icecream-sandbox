@@ -349,6 +349,43 @@ Test name references below are exact. Unit tests live in
   `computed import() of an unfetched module fails naming it`; unit
   `host.importModule resolves only map keys`.
 
+### T28. Bridged-global abuse (guest → host)
+
+- **Attack:** guest code calling a bridged global with malicious
+  arguments (prototype-polluting keys, non-JSON values, huge
+  payloads) to corrupt host state or smuggle data; or a forged
+  bridge spec reaching the worker to install `__proto__`.
+- **Prevention:** arguments and return values are JSON-only —
+  non-serializable arguments fail loudly in the guest before
+  crossing. The host dispatcher looks the path up in its own config
+  through own properties only and never trusts the path off the
+  wire. `__proto__` is rejected both in the host config validator
+  and in the worker-side spec shape check, so no spec can touch the
+  prototype. The worker never sees host functions, only the
+  shape-only spec.
+- **Tests:** unit `non-JSON-serializable arguments fail loudly in
+  the guest`, `rejects __proto__ as a configured name`,
+  `isBridgeSpec ... rejects __proto__`, and `a host failure rejects
+  the guest's await`.
+
+### T29. Guest-invocation abuse (host → guest)
+
+- **Attack:** invoking a path the host did not allow, or
+  traversing the prototype chain (`myApp.constructor`,
+  `myApp.__proto__`) to reach unintended functions; a guest
+  function returning a non-string to smuggle a handle across.
+- **Prevention:** the `guestFunctions` allowlist is host-defined
+  and the guest cannot expand it — anything else rejects. Paths
+  resolve through own properties only (checked with
+  `hasOwnProperty` at every step), so prototype traversal cannot
+  resolve. Results must be strings, like every guest→host value.
+  Only `globalThis` properties are reachable at all.
+- **Tests:** unit `rejects a path outside the allowlist`, `rejects
+  prototype-chain traversal`, `rejects a non-function final value`,
+  `rejects a non-string return`, and `invoke-guest with no active
+  run errors`; browser `end to end` asserts the disallowed invoke
+  rejects.
+
 ## Bugs caught by this suite
 
 The security suite is not decorative — it has already caught real

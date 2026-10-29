@@ -7,10 +7,11 @@
  */
 import type { ResolvedLimits } from "./limits.js";
 import type { ImportMap } from "./imports.js";
+import { isBridgeSpec, isGuestFunctionsList, type BridgeSpec } from "./bridge.js";
 
 /** Host -> worker. */
 export type HostToWorkerMessage =
-  | { t: "run"; id: number; code: string; limits: ResolvedLimits; imports: ImportMap }
+  | { t: "run"; id: number; code: string; limits: ResolvedLimits; imports: ImportMap; bridge?: BridgeSpec | undefined; guestFunctions?: string[] | undefined }
   | { t: "send"; message: string }
   | { t: "ask-result"; id: number; value: string }
   | { t: "ask-error"; id: number; error: string }
@@ -18,6 +19,9 @@ export type HostToWorkerMessage =
   | { t: "connection-error"; id: number; error: string }
   | { t: "import-result"; id: number; value: string }
   | { t: "import-error"; id: number; error: string }
+  | { t: "bridge-result"; id: number; value: string }
+  | { t: "bridge-error"; id: number; error: string }
+  | { t: "invoke-guest"; id: number; path: string; arg: string }
   | { t: "dispose" };
 
 /** Worker -> host. */
@@ -29,6 +33,9 @@ export type WorkerToHostMessage =
   | { t: "ask"; id: number; name: string; arg: string }
   | { t: "connection-request"; id: number; url: string }
   | { t: "import-request"; id: number; url: string }
+  | { t: "bridge-call"; id: number; path: string; args: string }
+  | { t: "invoke-result"; id: number; value: string }
+  | { t: "invoke-error"; id: number; error: string }
   | { t: "guest-error"; error: string };
 
 export function encodeMessage(message: HostToWorkerMessage | WorkerToHostMessage): string {
@@ -61,13 +68,19 @@ export function decodeMessage(
       return typeof record["id"] === "number" &&
         typeof record["code"] === "string" &&
         isResolvedLimits(record["limits"]) &&
-        isImportMap(record["imports"])
+        isImportMap(record["imports"]) &&
+        (record["bridge"] === undefined || isBridgeSpec(record["bridge"])) &&
+        (record["guestFunctions"] === undefined || isGuestFunctionsList(record["guestFunctions"]))
         ? {
             t: "run",
             id: record["id"],
             code: record["code"],
             limits: record["limits"],
             imports: record["imports"],
+            bridge: isBridgeSpec(record["bridge"]) ? record["bridge"] : undefined,
+            guestFunctions: isGuestFunctionsList(record["guestFunctions"])
+              ? record["guestFunctions"]
+              : undefined,
           }
         : null;
     case "send":
@@ -98,6 +111,20 @@ export function decodeMessage(
         : null;
     case "dispose":
       return { t: "dispose" };
+    case "bridge-result":
+      return typeof record["id"] === "number" && typeof record["value"] === "string"
+        ? { t: "bridge-result", id: record["id"], value: record["value"] }
+        : null;
+    case "bridge-error":
+      return typeof record["id"] === "number" && typeof record["error"] === "string"
+        ? { t: "bridge-error", id: record["id"], error: record["error"] }
+        : null;
+    case "invoke-guest":
+      return typeof record["id"] === "number" &&
+        typeof record["path"] === "string" &&
+        typeof record["arg"] === "string"
+        ? { t: "invoke-guest", id: record["id"], path: record["path"], arg: record["arg"] }
+        : null;
     case "ready":
       return typeof record["nonce"] === "string" ? { t: "ready", nonce: record["nonce"] } : null;
     case "result":
@@ -125,6 +152,20 @@ export function decodeMessage(
     case "import-request":
       return typeof record["id"] === "number" && typeof record["url"] === "string"
         ? { t: "import-request", id: record["id"], url: record["url"] }
+        : null;
+    case "bridge-call":
+      return typeof record["id"] === "number" &&
+        typeof record["path"] === "string" &&
+        typeof record["args"] === "string"
+        ? { t: "bridge-call", id: record["id"], path: record["path"], args: record["args"] }
+        : null;
+    case "invoke-result":
+      return typeof record["id"] === "number" && typeof record["value"] === "string"
+        ? { t: "invoke-result", id: record["id"], value: record["value"] }
+        : null;
+    case "invoke-error":
+      return typeof record["id"] === "number" && typeof record["error"] === "string"
+        ? { t: "invoke-error", id: record["id"], error: record["error"] }
         : null;
     case "guest-error":
       return typeof record["error"] === "string"

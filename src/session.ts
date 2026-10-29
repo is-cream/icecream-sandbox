@@ -16,8 +16,12 @@ import {
   type RunLimits,
 } from "./limits.js";
 import { validateImportMap, type ImportMap } from "./imports.js";
+import type { BridgeSpec, JsonValue } from "./bridge.js";
 
 export type AskHandler = (arg: string) => string | Promise<string>;
+
+/** One host implementation behind a bridged global, by dotted path. */
+export type BridgeHandler = (path: string, args: JsonValue[]) => Promise<JsonValue>;
 
 export type SessionEvent = "message" | "error";
 
@@ -41,12 +45,17 @@ export class Session {
   private errorListeners = new Set<(error: string) => void>();
   private askHandlers = new Map<string, AskHandler>();
   private runId = 0;
+  private invokeId = 0;
   private pendingRun: {
     id: number;
     resolve: (value: string) => void;
     reject: (error: Error) => void;
     watchdog: ReturnType<typeof setTimeout>;
   } | null = null;
+  private pendingInvokes = new Map<
+    number,
+    { resolve: (value: string) => void; reject: (error: Error) => void }
+  >();
   private failed = false;
   private disposed = false;
   /** Called exactly once when the session fails (watchdog, port loss). */
@@ -66,15 +75,34 @@ export class Session {
   /** Resolved when the worker's ready message arrives with the right nonce. */
   readonly ready: Promise<void>;
   private readyResolve: () => void = () => undefined;
+  /**
+   * Host-side bridge dispatcher (Sandbox's `globals` config). When
+   * null, every guest bridge call is answered with an error — fail
+   * closed. The worker only ever sends paths from the configured
+   * spec, but the dispatcher looks the path up anyway and never
+   * trusts it.
+   */
+  onBridgeRequest: BridgeHandler | null = null;
+  /** Shape-only bridge spec + guest-function allowlist, sent with each run. */
+  private readonly bridgeSpec: BridgeSpec;
+  private readonly guestFunctions: string[];
 
   constructor(
     port: PortLike,
-    options: { maxInboundBytes: number; expectedNonce: string; maxMessageSize?: number },
+    options: {
+      maxInboundBytes: number;
+      expectedNonce: string;
+      maxMessageSize?: number;
+      bridgeSpec?: BridgeSpec;
+      guestFunctions?: string[];
+    },
   ) {
     this.port = port;
     this.maxInboundBytes = options.maxInboundBytes;
     this.maxMessageSize = options.maxMessageSize ?? DEFAULT_LIMITS.maxMessageSize;
     this.expectedNonce = options.expectedNonce;
+    this.bridgeSpec = options.bridgeSpec ?? {};
+    this.guestFunctions = options.guestFunctions ?? [];
     this.ready = new Promise<void>((resolve) => {
       this.readyResolve = resolve;
     });
@@ -137,7 +165,43 @@ export class Session {
         }
       }, limits.deadlineMs * WATCHDOG_MULTIPLIER);
       this.pendingRun = { id, resolve, reject, watchdog };
-      this.port.postMessage(encodeMessage({ t: "run", id, code, limits, imports }));
+      this.port.postMessage(
+        encodeMessage({
+          t: "run",
+          id,
+          code,
+          limits,
+          imports,
+          bridge: this.bridgeSpec,
+          guestFunctions: this.guestFunctions,
+        }),
+      );
+    });
+  }
+
+  /**
+   * Call a guest function by dotted path (host -> guest). Only names
+   * in the sandbox's `guestFunctions` allowlist resolve; anything
+   * else rejects. The guest function receives one string argument and
+   * must return a string. The call is bounded by the in-flight run:
+   * if the run ends first, the promise rejects.
+   */
+  invoke(path: string, arg: string): Promise<string> {
+    if (this.disposed) return Promise.reject(new Error("session is disposed"));
+    if (this.failed) return Promise.reject(new Error("session failed; create a new session"));
+    if (typeof path !== "string" || path.length === 0) {
+      return Promise.reject(new Error("invoke: path must be a non-empty string"));
+    }
+    if (typeof arg !== "string") {
+      return Promise.reject(new Error("invoke: arg must be a string"));
+    }
+    if (this.pendingRun === null) {
+      return Promise.reject(new Error("invoke: no run in flight to invoke a guest function on"));
+    }
+    const id = ++this.invokeId;
+    return new Promise<string>((resolve, reject) => {
+      this.pendingInvokes.set(id, { resolve, reject });
+      this.port.postMessage(encodeMessage({ t: "invoke-guest", id, path, arg }));
     });
   }
 
@@ -160,6 +224,7 @@ export class Session {
       this.pendingRun.reject(new Error("session disposed"));
       this.pendingRun = null;
     }
+    this.rejectInvokes(new Error("session disposed"));
     try {
       this.port.postMessage(encodeMessage({ t: "dispose" }));
     } catch {
@@ -176,6 +241,7 @@ export class Session {
   private fail(): void {
     if (this.failed) return;
     this.failed = true;
+    this.rejectInvokes(new Error("session failed; create a new session"));
     try {
       this.port.close?.();
     } catch {
@@ -201,6 +267,9 @@ export class Session {
           clearTimeout(pending.watchdog);
           if (message.t === "result") pending.resolve(message.value);
           else pending.reject(new Error(message.error));
+          this.rejectInvokes(
+            new Error("the run ended before the guest answered the invocation"),
+          );
         }
         return;
       }
@@ -222,6 +291,66 @@ export class Session {
         void this.answerImport(message.id, message.url);
         return;
       }
+      case "bridge-call": {
+        void this.answerBridge(message.id, message.path, message.args);
+        return;
+      }
+      case "invoke-result": {
+        const pending = this.pendingInvokes.get(message.id);
+        if (pending !== undefined) {
+          this.pendingInvokes.delete(message.id);
+          pending.resolve(message.value);
+        }
+        return;
+      }
+      case "invoke-error": {
+        const pending = this.pendingInvokes.get(message.id);
+        if (pending !== undefined) {
+          this.pendingInvokes.delete(message.id);
+          pending.reject(new Error(message.error));
+        }
+        return;
+      }
+    }
+  }
+
+  private rejectInvokes(error: Error): void {
+    if (this.pendingInvokes.size === 0) return;
+    const pending = Array.from(this.pendingInvokes.values());
+    this.pendingInvokes.clear();
+    for (const entry of pending) entry.reject(error);
+  }
+
+  /**
+   * Answer one guest call of a bridged global. The path is looked up
+   * in the host's own config (own properties only) and the arguments
+   * arrive as JSON; the implementation's return value must be
+   * JSON-serializable. A host function returning undefined resolves
+   * the guest's await with null.
+   */
+  private async answerBridge(id: number, path: string, argsJson: string): Promise<void> {
+    if (this.onBridgeRequest === null) {
+      this.post({ t: "bridge-error", id, error: "bridged globals are not enabled" });
+      return;
+    }
+    try {
+      const parsed: unknown = JSON.parse(argsJson);
+      if (!Array.isArray(parsed)) {
+        throw new Error("bridge call arguments must be a JSON array");
+      }
+      const value = await this.onBridgeRequest(path, parsed as JsonValue[]);
+      const json = JSON.stringify(value);
+      this.post({
+        t: "bridge-result",
+        id,
+        value: json === undefined ? "null" : json,
+      });
+    } catch (error) {
+      this.post({
+        t: "bridge-error",
+        id,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -317,7 +446,9 @@ export class Session {
       | { t: "connection-result"; id: number; value: string }
       | { t: "connection-error"; id: number; error: string }
       | { t: "import-result"; id: number; value: string }
-      | { t: "import-error"; id: number; error: string },
+      | { t: "import-error"; id: number; error: string }
+      | { t: "bridge-result"; id: number; value: string }
+      | { t: "bridge-error"; id: number; error: string },
   ): void {
     if (this.disposed || this.failed) return;
     try {
