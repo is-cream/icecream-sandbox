@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Static import + dynamic import — icecream-sandbox example</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; }
+  #app-root { border: 1px solid #ccc; border-radius: 12px; padding: 1rem 1.25rem; margin: 1rem 0; }
+  #status { background: #111; color: #eee; padding: 0.75rem 1rem; border-radius: 8px; min-height: 1.5rem; }
+  code { background: #f0f0f0; padding: 0 0.25rem; border-radius: 4px; }
+  pre { background: #f7f7f7; padding: 0.75rem; border-radius: 8px; overflow-x: auto; }
+</style>
+</head>
+<body>
+<h1>Static import + dynamic import</h1>
+<p>
+  One guest app, two real chart libraries, two import styles. The app
+  is a module running inside QuickJS in a Web Worker inside a
+  sandboxed iframe (<code>icecream-sandbox</code>).
+</p>
+<ul>
+  <li><strong>Static:</strong> the first line is
+    <code>import { Chart } from 'chart.js'</code> — Chart.js 4.6.1
+    downloads with the import graph (including its own dependency,
+    <code>@kurkle/color</code>) and is ready before anything runs.</li>
+  <li><strong>Dynamic:</strong> press <strong>Load Chartist</strong>
+    and the guest imports Chartist 1.3.1 <em>by name, at that
+    moment</em> — the host approves the origin, the module downloads,
+    and the guest re-renders with it.</li>
+</ul>
+<div id="app-root"></div>
+<p id="status">Loading guest app…</p>
+<p>
+  Both downloads go through the same connection gate and the same
+  host-side cache: approve an origin once and later loads are silent.
+  The app decides which packages exist via the import map — the guest
+  only picks among them, whether by literal import or by name.
+</p>
+
+<!-- Guest module: a static Chart.js import up top, a dynamic
+     Chartist import on button click. type="text/plain" so the
+     browser does not execute it; the host runs it in the sandbox. -->
+<script type="text/plain" id="guest-code">
+import { Chart } from 'chart.js';
+import * as ChartNS from 'chart.js';
+
+var state = { chartist: null, sumResult: null, lineChartType: null };
+var done = null;
+
+// A real Chart.js config, built with the statically imported library.
+var chartConfig = {
+  type: 'bar',
+  data: {
+    labels: ['Q1', 'Q2', 'Q3', 'Q4'],
+    datasets: [{ label: 'Revenue', data: [120, 190, 300, 500] }]
+  },
+  options: { plugins: { title: { display: true, text: 'Built with Chart.js ' + Chart.version } } }
+};
+
+function tree() {
+  var kids = [
+    { type: 'h2', children: ['Static import: Chart.js'] },
+    { type: 'p', children: [
+      'Chart.js ' + Chart.version + ' loaded with a static import. ' +
+      'The module ships ' + Object.keys(ChartNS).length + ' named exports; ' +
+      'its own dependency @kurkle/color downloaded as a transitive hop.'
+    ] },
+    { type: 'pre', children: [JSON.stringify(chartConfig, null, 1)] },
+    { type: 'h2', children: ['Dynamic import: Chartist'] }
+  ];
+  if (state.chartist === null) {
+    kids.push({ type: 'button', props: { onClick: 'load' }, children: ['Load Chartist'] });
+    kids.push({ type: 'p', children: ['Not loaded yet. Nothing downloaded for Chartist yet.'] });
+  } else {
+    kids.push({ type: 'p', children: [
+      'Chartist loaded on demand via host.importModule. ' +
+      'sum(19, 23) = ' + state.sumResult + '; ' +
+      'LineChart is a ' + state.lineChartType + '.'
+    ] });
+  }
+  return { type: 'div', children: kids };
+}
+function render() {
+  host.send(JSON.stringify({ kind: 'render', tree: tree() }));
+}
+globalThis.onMessage = function (m) {
+  try {
+    var msg = JSON.parse(m);
+    if (msg.kind === 'event' && msg.id === 'load') {
+      var name = 'chartist';
+      host.importModule(name).then(function (mod) {
+        state.chartist = mod;
+        state.sumResult = mod.sum(19, 23);
+        state.lineChartType = typeof mod.LineChart;
+        host.send('loaded:host.importModule');
+        render();
+      });
+    } else if (msg.kind === 'quit') {
+      if (done !== null) done();
+    }
+  } catch (e) {}
+};
+render();
+await new Promise(function (r) { done = r; });
+</script>
+
+<script type="module">
+  import { Sandbox, renderGuestTree } from "/dist/index.js";
+
+  const statusEl = document.getElementById("status");
+  const setStatus = (line) => { statusEl.textContent = line; };
+  let prompts = 0;
+
+  // The import map: the app decides which packages exist.
+  const IMPORTS = {
+    "chart.js": location.origin + "/vendor/chart.js.mjs",
+    "chartist": location.origin + "/vendor/chartist.mjs",
+  };
+
+  const sandbox = await Sandbox.create({
+    iframeUrl: "/iframe.html",
+    onConnectionRequest: (req) => {
+      // Human-in-the-loop approval for download origins. The Chart.js
+      // graph (chart.js + its @kurkle/color hop) prompts once up
+      // front; the Chartist button prompts once on click.
+      prompts++;
+      const ok = confirm("Allow the guest app to download modules from?\n\n" + req.origin + "\n\nOne approval covers every module from this origin, including later cached loads.");
+      return ok ? "allow-session" : "deny";
+    },
+  });
+  sandbox.on("message", (m) => {
+    try {
+      const msg = JSON.parse(m);
+      if (msg && msg.kind === "render") {
+        renderGuestTree(document.getElementById("app-root"), msg.tree, {
+          onEvent: (id, value) => sandbox.send(JSON.stringify({ kind: "event", id, value })),
+        });
+        return;
+      }
+    } catch { /* not a render message */ }
+    if (m.indexOf("loaded:") === 0) {
+      setStatus("Chartist loaded on demand via " + m.slice("loaded:".length) + ". Import prompts: " + prompts + ". Modules cached: " + sandbox.getImportCache().length + ".");
+    }
+  });
+  sandbox.on("error", (e) => setStatus("Guest error: " + e));
+
+  const code = document.getElementById("guest-code").textContent;
+  const run = sandbox.run(code, { deadlineMs: 60000 }, IMPORTS);
+  run.then(
+    () => {},
+    (e) => setStatus("Guest error: " + e.message),
+  );
+  setStatus("Guest app rendered. Chart.js came with the static import graph; Chartist waits for its button.");
+</script>
+</body>
+</html>

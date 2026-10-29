@@ -486,6 +486,13 @@ are unavailable.
   as a module rendering from the cache. Run `npm run demo`, then open
   `/examples/dynamic-import.html`. A screenshot of it is in
   `examples/dynamic-import.png`.
+- `examples/static-dynamic-imports.html` — one guest app, two real
+  chart libraries, two import styles: Chart.js 4.6.1 via a static
+  import (with its transitive `@kurkle/color` dependency) and
+  Chartist 1.3.1 via a dynamic `host.importModule` on button click.
+  Run `npm run demo`, then open
+  `/examples/static-dynamic-imports.html`. A screenshot of it is in
+  `examples/static-dynamic-imports.png`.
 
 ## Development
 

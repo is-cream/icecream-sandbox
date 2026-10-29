@@ -56,8 +56,11 @@ export function scanModuleSpecifiers(code: string): string[] {
   const seen = new Set<string>();
   // One alternation: comments and string literals are consumed and
   // ignored; only real import/export-from statements produce a match.
+  // Note the \s* (not \s+): minified bundles write from"x",
+  // import"x", and export{a}from"x" with no space at all, and real
+  // packages ship minified (Chart.js's bundle taught us this).
   const token =
-    /\/\/[^\n]*|\/\*[\s\S]*?\*\/|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`|\b(?:import|export)\s+(?:[\w$*{},\s]+?\s+from\s+)?(['"])((?:(?!\1).)+)\1/g;
+    /\/\/[^\n]*|\/\*[\s\S]*?\*\/|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`|\b(?:import|export)\s*(?:[\w$*{},\s]+?\s*from\s*)?(['"])((?:(?!\1).)+)\1/g;
   let match: RegExpExecArray | null;
   while ((match = token.exec(code)) !== null) {
     const quote = match[1];

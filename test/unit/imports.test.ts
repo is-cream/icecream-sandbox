@@ -23,7 +23,21 @@ const D3_FORMAT = readFileSync(
   "utf8",
 );
 
-describe("scanModuleSpecifiers", () => {
+describe("scanModuleSpecifiers minified forms", () => {
+  it("finds imports with no space after from (minified bundles)", () => {
+    // Real packages ship minified: Chart.js's bundle writes
+    // from"/npm/@kurkle/color@0.3.4/+esm".
+    const code = `import{Chart as C}from"chart";import"x";export{a as b}from"y";`;
+    expect(scanModuleSpecifiers(code)).toEqual(["chart", "x", "y"]);
+  });
+
+  it("still skips comments, strings, and non-import words", () => {
+    const code = `// import"nope";\nconst s = "from\\"nope2\\"";\nconst important = 1;\nimport{o}from"yes";`;
+    expect(scanModuleSpecifiers(code)).toEqual(["yes"]);
+  });
+});
+
+describe("scanDynamicImportSpecifiers", () => {
   it("finds every static import form", () => {
     const code = `
       import def from 'a';
@@ -63,7 +77,7 @@ describe("scanModuleSpecifiers", () => {
   });
 });
 
-describe("scanDynamicImportSpecifiers", () => {
+describe("scanModuleSpecifiers", () => {
   it("finds string-literal dynamic imports", () => {
     const code = `
       const a = await import('x');
@@ -418,6 +432,50 @@ describe("GuestRunner dynamic imports", () => {
         D3_MAP,
       ),
     ).rejects.toThrow(/could not load module 'd3-format'/);
+  });
+
+  it("static import of the real Chart.js bundle (with a transitive dep)", async () => {
+    // chart.js's bundle imports /npm/@kurkle/color@0.3.4/+esm — a
+    // path-absolute specifier that resolves against the importing
+    // module's origin and downloads through the gate like any hop.
+    const CHART_URL = "https://cdn.jsdelivr.net/npm/chart.js@4.6.1/+esm";
+    const COLOR_URL = "https://cdn.jsdelivr.net/npm/@kurkle/color@0.3.4/+esm";
+    const { messages } = await driveModule(
+      `import { Chart } from 'chart.js';
+       host.send(Chart.version + "/" + typeof Chart.register);`,
+      {
+        [CHART_URL]: readFileSync(
+          new URL("../../examples/vendor/chart.js.mjs", import.meta.url),
+          "utf8",
+        ),
+        [COLOR_URL]: readFileSync(
+          new URL("../../examples/vendor/kurkle-color.mjs", import.meta.url),
+          "utf8",
+        ),
+      },
+      { "chart.js": CHART_URL },
+    );
+    expect(messages).toEqual(["4.6.1/function"]);
+  });
+
+  it("dynamic import of the real Chartist bundle by computed name", async () => {
+    const CHARTIST_URL = "https://cdn.jsdelivr.net/npm/chartist@1.3.1/+esm";
+    const { messages } = await driveModule(
+      `(async () => {
+         const name = 'chartist';
+         const mod = await host.importModule(name);
+         host.send(mod.sum(19, 23) + "/" + typeof mod.LineChart);
+         return "done";
+       })()`,
+      {
+        [CHARTIST_URL]: readFileSync(
+          new URL("../../examples/vendor/chartist.mjs", import.meta.url),
+          "utf8",
+        ),
+      },
+      { chartist: CHARTIST_URL },
+    );
+    expect(messages).toEqual(["42/function"]);
   });
 
   it("a computed import() works once the module is already downloaded", async () => {

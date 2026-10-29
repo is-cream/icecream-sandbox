@@ -106,6 +106,17 @@ const server = createServer((req, res) => {
       res.end(readFileSync(file));
       return;
     }
+    if (path === "/npm/@kurkle/color@0.3.4/+esm") {
+      // Path-absolute specifier inside jsDelivr's Chart.js bundle
+      // (import...from"/npm/@kurkle/color@0.3.4/+esm"). It resolves
+      // against the importing module's origin — the demo server — so
+      // serve the vendored copy here. The gate still approves the
+      // origin; this only decides what bytes that origin returns.
+      const file = join(root, "examples/vendor/kurkle-color.mjs");
+      res.writeHead(200, { "content-type": MIME[".mjs"] });
+      res.end(readFileSync(file));
+      return;
+    }
     if (path.startsWith("/examples/")) {
       // Example pages (e.g. /examples/population-chart.html).
       const file = normalize(join(root, path));
