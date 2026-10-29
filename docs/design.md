@@ -273,6 +273,43 @@ Key details:
   response cap, and the port's `maxInboundBytes` (a module source
   must fit both to cross).
 
+### Dynamic imports
+
+Literal dynamic imports need no new machinery: the scanner treats
+`import('x')` as a graph edge, so the module is pre-fetched like a
+static import and `import()` at runtime resolves from the map. Only
+the evaluation is lazy — the download is not, and the docs say so
+plainly.
+
+Computed names go through `host.importModule(name)`, which is a
+guest function, not syntax:
+
+```mermaid
+sequenceDiagram
+    participant G as guest app
+    participant W as worker / GuestRunner
+    participant SB as Sandbox
+    participant Gate as ConnectionGate
+    participant Cache as ImportCache
+    G->>W: host.importModule(name)
+    W->>W: name must be an import-map key, else throw
+    W->>SB: import-request(url) — unless already in the run map
+    SB->>Cache: hit? else Gate fetch (approval per origin)
+    SB->>W: import-result(source)
+    W->>W: fetch the module's transitive graph the same way
+    W->>W: evalCode(source, type: "module")
+    W-->>G: promise resolves with the namespace
+    G->>G: re-render with the loaded module
+```
+
+The namespace promise is what makes "downloaded, then re-rendered"
+work: the guest awaits it, then renders. If the module has a
+top-level await, the promise settles only after it — the pump loop
+settles these evaluations alongside the run's main completion,
+because their jobs share the same queue. The map-only rule is the
+security point: a computed name can only select among packages the
+app already declared, never an arbitrary URL the guest invented.
+
 ## Guest UI rendering
 
 The guest cannot touch the DOM. It can still render, because rendering

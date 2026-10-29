@@ -16,9 +16,15 @@
  *   port, where async is natural. The loader then serves sources from
  *   the pre-fetched map, and evaluation uses real QuickJS module
  *   semantics (real imports/exports, no source rewriting).
- * - Only static imports are resolved. Dynamic `import()` with a
- *   computed specifier cannot be pre-fetched, so it fails at runtime
- *   with a clear "module not prefetched" error.
+ * - Static imports and string-literal dynamic imports are both
+ *   pre-fetched: `import('d3-format')` is a graph edge exactly like a
+ *   static import, so it works at runtime — the module evaluates
+ *   lazily when `import()` runs, even though its download happened up
+ *   front with the rest of the graph. Only a COMPUTED specifier
+ *   (`import(name)`, where `name` is a variable) cannot be
+ *   pre-fetched; for those, the guest calls `host.importModule(name)`
+ *   instead, which downloads through the same gate and cache at call
+ *   time and resolves with the module's namespace.
  * - Relative imports are resolved against the importing module's URL,
  *   so a fetched module can import its own siblings. The entry module
  *   has no URL, so a relative import in guest entry code is an error
@@ -68,6 +74,36 @@ export function scanModuleSpecifiers(code: string): string[] {
 /** True when the code contains a static import or export statement. */
 export function isModuleCode(code: string): boolean {
   return scanModuleSpecifiers(code).length > 0;
+}
+
+/**
+ * The specifiers in string-literal dynamic imports, `import('x')` and
+ * `import("x")`, in first-seen order, deduplicated. These are graph
+ * edges exactly like static imports — the worker pre-fetches them, so
+ * `import()` at runtime resolves from the pre-fetched map and the
+ * guest re-renders with the loaded module. Computed specifiers
+ * (`import(name)`, template literals) are NOT collected: they cannot
+ * be known ahead of time, so they go through `host.importModule`
+ * instead. Comments and string literals are skipped like in
+ * scanModuleSpecifiers, so an `import('x')` mentioned in a comment
+ * or a string is not treated as a real import.
+ */
+export function scanDynamicImportSpecifiers(code: string): string[] {
+  const found: string[] = [];
+  const seen = new Set<string>();
+  const token =
+    /\/\/[^\n]*|\/\*[\s\S]*?\*\/|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`|\bimport\s*\(\s*(['"])((?:(?!\1).)+)\1\s*\)/g;
+  let match: RegExpExecArray | null;
+  while ((match = token.exec(code)) !== null) {
+    const quote = match[1];
+    const specifier = match[2];
+    if (quote === undefined || specifier === undefined) continue;
+    if (!seen.has(specifier)) {
+      seen.add(specifier);
+      found.push(specifier);
+    }
+  }
+  return found;
 }
 
 /**

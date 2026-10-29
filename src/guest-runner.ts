@@ -6,9 +6,11 @@
  * of all after an out-of-memory error, where the heap may be corrupt.
  *
  * The guest sees exactly one global besides the standard intrinsics: `host`,
- * with `host.send(string)`, `host.ask(name, arg?) -> Promise<string>`, and
- * `host.fetchText(url) -> Promise<string>` (a gated host-side fetch — see
- * connections.ts; the guest itself has no network capability).
+ * with `host.send(string)`, `host.ask(name, arg?) -> Promise<string>`,
+ * `host.fetchText(url) -> Promise<string>` (a gated host-side fetch —
+ * see connections.ts; the guest itself has no network capability), and
+ * `host.importModule(name) -> Promise<namespace>` (a gated, cached
+ * dynamic import for computed specifiers — see imports.ts).
  * Everything else — fetch, XHR, WebSocket, timers, process, require, DOM —
  * simply does not exist in a QuickJS context, because nothing puts it there.
  *
@@ -37,6 +39,7 @@ import type { ResolvedLimits } from "./limits.js";
 import {
   isModuleCode,
   resolveSpecifier,
+  scanDynamicImportSpecifiers,
   scanModuleSpecifiers,
   type ImportMap,
 } from "./imports.js";
@@ -67,6 +70,19 @@ interface ActiveRun {
    * only rejects them — nothing to dispose.
    */
   pendingImports: Map<number, { resolve: (value: string) => void; reject: (error: Error) => void }>;
+  /** The run's import map (host-supplied, per run). */
+  importMap: ImportMap;
+  /** Pre-fetched module sources, keyed by resolved URL. The module
+   * loader's only source of truth; grows as host.importModule calls
+   * fetch more modules mid-run. */
+  modules: Map<string, string>;
+  loaderInstalled: boolean;
+  /**
+   * Module evaluations started by host.importModule whose top-level
+   * await has not settled yet. The pump loop settles these alongside
+   * the run's main completion (their jobs share the same queue).
+   */
+  pendingModuleEvals: Array<{ promise: QuickJSHandle; deferred: QuickJSDeferredPromise }>;
   wakeResolvers: Array<() => void>;
   /**
    * True once the pump loop's finally has run (and disposed the completion
@@ -191,6 +207,10 @@ export class GuestRunner {
       pendingAsks: new Map(),
       pendingFetches: new Map(),
       pendingImports: new Map(),
+      importMap: imports,
+      modules: new Map(),
+      loaderInstalled: false,
+      pendingModuleEvals: [],
       wakeResolvers: [],
       pumpExited: false,
       resourcesDisposed: false,
@@ -201,16 +221,21 @@ export class GuestRunner {
       runtime.setMaxStackSize(limits.maxStackSize);
       runtime.setInterruptHandler(shouldInterruptAfterDeadline(run.deadlineAt));
       this.installHost(run);
-      // Module runs pre-fetch the whole static import graph before
-      // evaluating anything (see imports.ts for why). Classic scripts
-      // skip this entirely and behave exactly as before.
-      const moduleSetup = isModuleCode(code)
-        ? {
-            modules: await this.prefetchImports(run, code, imports),
-            importMap: imports,
-          }
-        : null;
-      const result = await this.evalAndPump(run, code, moduleSetup);
+      // The import graph is pre-fetched before evaluation: static
+      // imports AND string-literal dynamic imports (see imports.ts for
+      // why the loader must be fed up front). A classic script that
+      // lazy-loads a package keeps classic semantics — its completion
+      // value is preserved — while import() resolves from the
+      // pre-fetched map and the guest re-renders with the module.
+      const staticModule = isModuleCode(code);
+      const seeds = [
+        ...scanModuleSpecifiers(code),
+        ...scanDynamicImportSpecifiers(code),
+      ].map((specifier) => ({ specifier, base: null as string | null, depth: 0 }));
+      if (staticModule || seeds.length > 0) {
+        await this.prefetchImports(run, seeds);
+      }
+      const result = await this.evalAndPump(run, code, staticModule);
       this.accountOutput(run, result);
       this.reply({ t: "result", id, value: result });
     } catch (error) {
@@ -221,24 +246,22 @@ export class GuestRunner {
   }
 
   /**
-   * Resolve and download the static import graph for one module run.
-   * Breadth-first from the entry code: each specifier resolves (import
-   * map or relative to its importing module's URL) and is fetched once
-   * from the host, which routes the download through the connection
-   * gate — so the first download from an origin prompts, a granted
-   * origin downloads silently, and the host-side cache means a second
-   * run never downloads it again. Bounded by maxImportModules,
-   * maxImportDepth, and the run deadline; any failure names the
-   * specifier and fails the run before anything evaluates.
+   * Resolve and download an import graph into the run's module map.
+   * Breadth-first: each specifier resolves (import map or relative to
+   * its importing module's URL) and is fetched once from the host,
+   * which routes the download through the connection gate — so the
+   * first download from an origin prompts, a granted origin downloads
+   * silently, and the host-side cache means a second run never
+   * downloads it again. Fetched sources contribute both their static
+   * and their literal-dynamic imports to the walk. Bounded by
+   * maxImportModules, maxImportDepth, and the run deadline; any
+   * failure names the specifier.
    */
   private async prefetchImports(
     run: ActiveRun,
-    code: string,
-    importMap: ImportMap,
-  ): Promise<Map<string, string>> {
-    const modules = new Map<string, string>();
-    const queue: Array<{ specifier: string; base: string | null; depth: number }> =
-      scanModuleSpecifiers(code).map((specifier) => ({ specifier, base: null, depth: 0 }));
+    initial: Array<{ specifier: string; base: string | null; depth: number }>,
+  ): Promise<void> {
+    const queue = [...initial];
     const seen = new Set<string>();
     while (queue.length > 0) {
       const item = queue.shift();
@@ -249,19 +272,98 @@ export class GuestRunner {
       if (Date.now() > run.deadlineAt) {
         throw new Error("run deadline exceeded while fetching imports");
       }
-      const url = resolveSpecifier(item.specifier, item.base, importMap);
+      const url = resolveSpecifier(item.specifier, item.base, run.importMap);
       if (seen.has(url)) continue;
       seen.add(url);
-      if (modules.size >= run.limits.maxImportModules) {
+      if (run.modules.size >= run.limits.maxImportModules) {
         throw new Error("guest exceeded maxImportModules");
       }
       const source = await this.requestImport(run, url);
-      modules.set(url, source);
-      for (const specifier of scanModuleSpecifiers(source)) {
+      run.modules.set(url, source);
+      for (const specifier of [
+        ...scanModuleSpecifiers(source),
+        ...scanDynamicImportSpecifiers(source),
+      ]) {
         queue.push({ specifier, base: url, depth: item.depth + 1 });
       }
     }
-    return modules;
+  }
+
+  /**
+   * Fetch one module and its transitive graph into the run's module
+   * map (for host.importModule). A module already in the map is reused
+   * without a new download; its deps are still walked so a partially
+   * known graph completes. Returns the root module's source.
+   */
+  private async fetchModuleGraph(run: ActiveRun, rootUrl: string): Promise<string> {
+    let source = run.modules.get(rootUrl);
+    if (source === undefined) {
+      if (run.modules.size >= run.limits.maxImportModules) {
+        throw new Error("guest exceeded maxImportModules");
+      }
+      source = await this.requestImport(run, rootUrl);
+      run.modules.set(rootUrl, source);
+    }
+    const seeds = [
+      ...scanModuleSpecifiers(source),
+      ...scanDynamicImportSpecifiers(source),
+    ].map((specifier) => ({ specifier, base: rootUrl as string | null, depth: 1 }));
+    await this.prefetchImports(run, seeds);
+    return source;
+  }
+
+  /**
+   * Install the runtime's module loader and normalizer (once per run).
+   * The normalizer canonicalizes every specifier (import map for bare
+   * names, URL resolution for relatives); the loader serves only what
+   * prefetch or host.importModule already downloaded. A specifier the
+   * walker never saw fails here with its name attached — and, for a
+   * computed dynamic import, with a pointer to host.importModule,
+   * which is the call that CAN fetch it.
+   */
+  private ensureModuleLoader(run: ActiveRun): void {
+    if (run.loaderInstalled) return;
+    run.loaderInstalled = true;
+    run.runtime.setModuleLoader(
+      (normalizedName: string) => {
+        const source = run.modules.get(normalizedName);
+        if (source === undefined) {
+          return {
+            error: new Error(
+              `module not prefetched: ${normalizedName} ` +
+                `(for a computed specifier, use host.importModule(name))`,
+            ),
+          };
+        }
+        return source;
+      },
+      (baseModuleName: string, requestedName: string) => {
+        const base = /^https?:\/\//.test(baseModuleName) ? baseModuleName : null;
+        try {
+          const url = resolveSpecifier(requestedName, base, run.importMap);
+          // A bare map key that was never downloaded ahead of time can
+          // only come from a computed import() — static imports and
+          // literal dynamic imports are always pre-fetched, and a
+          // fetched module's own imports are walked with it. QuickJS
+          // replaces loader failures with its own generic text, so the
+          // guidance has to live here, where the message survives.
+          if (
+            run.importMap[requestedName] !== undefined &&
+            !run.modules.has(url)
+          ) {
+            return {
+              error: new Error(
+                `module "${requestedName}" was not downloaded ahead of time; ` +
+                  `for a computed import() use host.importModule("${requestedName}")`,
+              ),
+            };
+          }
+          return url;
+        } catch (error) {
+          return { error: error instanceof Error ? error : new Error(String(error)) };
+        }
+      },
+    );
   }
 
   private requestImport(run: ActiveRun, url: string): Promise<string> {
@@ -293,6 +395,30 @@ export class GuestRunner {
       pending.reject(new Error("run ended before the host answered the import"));
     }
     run.pendingImports.clear();
+    for (const entry of run.pendingModuleEvals) {
+      try {
+        const reason = run.context.newString("run ended before the imported module settled");
+        try {
+          entry.deferred.reject(reason);
+        } finally {
+          reason.dispose();
+        }
+      } catch {
+        // The runtime may already be unusable; disposal below still runs.
+      } finally {
+        try {
+          entry.deferred.dispose();
+        } catch {
+          // ignore
+        }
+        try {
+          entry.promise.dispose();
+        } catch {
+          // ignore
+        }
+      }
+    }
+    run.pendingModuleEvals = [];
     // Clear active FIRST and wake the pump loop, so it sees the run is
     // gone and throws "run aborted" instead of touching a disposed runtime.
     if (this.active === run) this.active = null;
@@ -390,6 +516,15 @@ export class GuestRunner {
           }),
         ),
       );
+      vm.setProp(
+        host,
+        "importModule",
+        scope.manage(
+          vm.newFunction("importModule", (specArg) => {
+            return this.guestImportModule(run, specArg);
+          }),
+        ),
+      );
       vm.setProp(vm.global, "host", host);
     });
   }
@@ -466,6 +601,165 @@ export class GuestRunner {
     this.accountOutput(run, url);
     this.reply({ t: "connection-request", id: fetchId, url });
     return deferred.handle;
+  }
+
+  /**
+   * Dynamically import a module by name at runtime, for specifiers
+   * that cannot be known ahead of time (a variable holding the name).
+   * The name MUST be a key in the run's import map: the app decides
+   * which packages exist, and the guest only picks among them. The
+   * module — and its transitive graph — downloads through the gate,
+   * is cached like any import, and evaluates in the guest realm; the
+   * returned promise resolves with the module's namespace, so the
+   * guest re-renders with it exactly like a lazy import() in a
+   * browser. Awaiting the promise is what "downloaded, then
+   * re-rendered" means for a computed name.
+   */
+  private guestImportModule(run: ActiveRun, specArg: QuickJSHandle): QuickJSHandle {
+    const vm = run.context;
+    if (vm.typeof(specArg) !== "string") {
+      throw new Error("host.importModule: specifier must be a string");
+    }
+    const specifier = vm.getString(specArg);
+    const url = run.importMap[specifier];
+    if (url === undefined) {
+      throw new Error(`host.importModule: unknown import "${specifier}" (not in the import map)`);
+    }
+    const deferred = vm.newPromise();
+    void this.loadModuleForImport(run, url, deferred);
+    return deferred.handle;
+  }
+
+  private async loadModuleForImport(
+    run: ActiveRun,
+    url: string,
+    deferred: QuickJSDeferredPromise,
+  ): Promise<void> {
+    const vm = run.context;
+    try {
+      // Yield first so the module evaluation below never runs nested
+      // inside the host-function call that started it.
+      await Promise.resolve();
+      this.ensureModuleLoader(run);
+      const source = await this.fetchModuleGraph(run, url);
+      const result = vm.evalCode(source, url, { type: "module" });
+      if (result.error) {
+        const text = this.renderError(vm, result.error);
+        result.error.dispose();
+        throw new Error(text);
+      }
+      const completion = result.value;
+      const state = vm.getPromiseState(completion);
+      if (state.type === "fulfilled" && state.notAPromise === true) {
+        // Synchronous module: resolve with the namespace now.
+        try {
+          deferred.resolve(completion);
+        } finally {
+          completion.dispose();
+          try {
+            deferred.dispose();
+          } catch {
+            // ignore
+          }
+        }
+        return;
+      }
+      if (state.type === "rejected") {
+        const text = this.renderError(vm, state.error);
+        state.error.dispose();
+        completion.dispose();
+        throw new Error(text);
+      }
+      // Top-level await: the pump loop settles this when the promise
+      // does (its jobs share the run's queue).
+      run.pendingModuleEvals.push({ promise: completion, deferred });
+      this.wake(run);
+    } catch (error) {
+      try {
+        const reason = vm.newString(errorText(error));
+        try {
+          deferred.reject(reason);
+        } finally {
+          reason.dispose();
+        }
+      } catch {
+        // The runtime may be mid-teardown; the pump loop will surface it.
+      } finally {
+        try {
+          deferred.dispose();
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  /**
+   * Settle host.importModule evaluations whose top-level await
+   * finished. Called each pump-loop iteration; their jobs run through
+   * the same executePendingJobs queue as the run's main completion.
+   */
+  private settleModuleEvals(run: ActiveRun): void {
+    const vm = run.context;
+    const remaining: typeof run.pendingModuleEvals = [];
+    for (const entry of run.pendingModuleEvals) {
+      let state;
+      try {
+        state = vm.getPromiseState(entry.promise);
+      } catch {
+        // Runtime mid-teardown; teardownRun disposes these.
+        remaining.push(entry);
+        continue;
+      }
+      if (state.type === "pending") {
+        remaining.push(entry);
+        continue;
+      }
+      if (state.type === "fulfilled") {
+        const value = state.value;
+        try {
+          entry.deferred.resolve(value);
+        } catch {
+          // ignore
+        } finally {
+          value.dispose();
+          try {
+            entry.deferred.dispose();
+          } catch {
+            // ignore
+          }
+        }
+      } else {
+        const text = this.renderError(vm, state.error);
+        try {
+          state.error.dispose();
+        } catch {
+          // ignore
+        }
+        try {
+          const reason = vm.newString(text);
+          try {
+            entry.deferred.reject(reason);
+          } finally {
+            reason.dispose();
+          }
+        } catch {
+          // ignore
+        } finally {
+          try {
+            entry.deferred.dispose();
+          } catch {
+            // ignore
+          }
+        }
+      }
+      try {
+        entry.promise.dispose();
+      } catch {
+        // ignore
+      }
+    }
+    run.pendingModuleEvals = remaining;
   }
 
   private settleFetch(fetchId: number, ok: boolean, value: string): void {
@@ -576,38 +870,18 @@ export class GuestRunner {
   private async evalAndPump(
     run: ActiveRun,
     code: string,
-    moduleSetup: { modules: Map<string, string>; importMap: ImportMap } | null,
+    isModule: boolean,
   ): Promise<string> {
     const vm = run.context;
-    if (moduleSetup !== null) {
-      // Real QuickJS module semantics, with the pre-fetched map as the
-      // only source of truth. The normalizer canonicalizes every
-      // specifier (import map for bare names, URL resolution for
-      // relatives); the loader serves pre-fetched sources. A specifier
-      // the prefetch never saw fails here with its name attached —
-      // never silently, never with a fetch the gate did not approve.
-      run.runtime.setModuleLoader(
-        (normalizedName: string) => {
-          const source = moduleSetup.modules.get(normalizedName);
-          if (source === undefined) {
-            return { error: new Error(`module not prefetched: ${normalizedName}`) };
-          }
-          return source;
-        },
-        (baseModuleName: string, requestedName: string) => {
-          const base = /^https?:\/\//.test(baseModuleName) ? baseModuleName : null;
-          try {
-            return resolveSpecifier(requestedName, base, moduleSetup.importMap);
-          } catch (error) {
-            return { error: error instanceof Error ? error : new Error(String(error)) };
-          }
-        },
-      );
+    // The loader is installed for module runs and for classic runs
+    // whose prefetch found dynamic imports. Classic runs without any
+    // imports keep no loader at all, exactly as before.
+    if (isModule || run.modules.size > 0) {
+      this.ensureModuleLoader(run);
     }
-    const result =
-      moduleSetup !== null
-        ? vm.evalCode(code, "guest.js", { type: "module" })
-        : vm.evalCode(code, "guest.js");
+    const result = isModule
+      ? vm.evalCode(code, "guest.js", { type: "module" })
+      : vm.evalCode(code, "guest.js");
     if (result.error) {
       const text = this.renderError(vm, result.error);
       result.error.dispose();
@@ -621,6 +895,9 @@ export class GuestRunner {
         if (this.active !== run) {
           throw new Error("run aborted");
         }
+        // Settle any host.importModule top-level awaits before looking
+        // at the main completion; their jobs share this queue.
+        this.settleModuleEvals(run);
         const state = vm.getPromiseState(completion);
         if (state.type === "fulfilled") {
           const value = state.value;
@@ -633,7 +910,7 @@ export class GuestRunner {
             // finishes synchronously resolves to "" — a top-level await
             // that fulfills with a string is the only way a module run
             // returns a value, mirroring the classic-script rule.
-            if (moduleSetup !== null) {
+            if (isModule) {
               if (isCompletion) return "";
               if (vm.typeof(value) !== "string") return "";
               return vm.getString(value);

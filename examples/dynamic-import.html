@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dynamic imports: downloaded, then re-rendered — icecream-sandbox example</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; }
+  #app-root { border: 1px solid #ccc; border-radius: 12px; padding: 1rem 1.25rem; margin: 1rem 0; }
+  #status { background: #111; color: #eee; padding: 0.75rem 1rem; border-radius: 8px; min-height: 1.5rem; }
+  code { background: #f0f0f0; padding: 0 0.25rem; border-radius: 4px; }
+  button#tryImport { font-size: 1rem; padding: 0.5rem 1rem; }
+</style>
+</head>
+<body>
+<h1>Dynamic imports: downloaded, then re-rendered</h1>
+<p>
+  This app is a guest component running inside QuickJS in a Web Worker
+  inside a sandboxed iframe (<code>icecream-sandbox</code>). It starts
+  with <strong>nothing downloaded</strong>. Press
+  <strong>Load formatter</strong> and the guest asks the host, at that
+  moment, to import the real d3-format package by name — the host asks
+  <em>you</em> to approve the download origin, the module downloads,
+  and the guest re-renders with it. That is a dynamic import:
+  downloaded when needed, then re-rendered.
+</p>
+<p>
+  Press <strong>Try the import() version</strong> and the same app
+  restarts as a module whose first line is
+  <code>import { format } from 'd3-format'</code>. It renders
+  immediately from the cache: no new prompt, no new download. Once a
+  module is downloaded, it stays cached.
+</p>
+<div id="app-root"></div>
+<p><button id="tryImport" type="button">Try the import() version</button></p>
+<p id="status">Loading guest app…</p>
+<p>
+  The two paths differ only in when the name is known. A literal
+  <code>import('d3-format')</code> is visible in the code, so the
+  sandbox downloads it up front with the rest of the import graph and
+  evaluates it lazily when <code>import()</code> runs. A computed name
+  (a variable) cannot be known ahead of time, so the guest calls
+  <code>host.importModule(name)</code> instead, which downloads
+  through the same gate and cache at call time. Either way, the app
+  decides which packages exist via the import map — the guest only
+  picks among them.
+</p>
+
+<!-- Guest 1: lazy load by computed name. type="text/plain" so the
+     browser does not execute it; the host runs it in the sandbox. -->
+<script type="text/plain" id="guest-lazy-code">
+(function () {
+  var SPECS = ['.2f', ',.0f', '.0%', '($.2f'];
+  var state = { loaded: false, value: 1234567.891, spec: '.2f' };
+  var formatFn = null;
+  var done = null;
+  function tree() {
+    var kids = [
+      { type: 'p', children: ['Type a number, then load the formatter:'] },
+      { type: 'input', props: { type: 'number', value: String(state.value), onInput: 'input' } }
+    ];
+    if (!state.loaded) {
+      kids.push({ type: 'button', props: { onClick: 'load' }, children: ['Load formatter'] });
+      kids.push({ type: 'p', children: ['No formatter loaded yet. Nothing downloaded yet.'] });
+    } else {
+      var buttons = [];
+      for (var i = 0; i < SPECS.length; i++) {
+        buttons.push({ type: 'button', props: { onClick: 'spec:' + SPECS[i] }, children: [SPECS[i]] });
+      }
+      kids.push({ type: 'div', children: buttons });
+      kids.push({ type: 'p', children: ['Formatted (' + state.spec + '): ' + formatFn(state.spec)(state.value)] });
+      kids.push({ type: 'p', children: ['Formatter loaded on demand via host.importModule.'] });
+    }
+    return { type: 'div', children: kids };
+  }
+  function render() {
+    host.send(JSON.stringify({ kind: 'render', tree: tree() }));
+  }
+  globalThis.onMessage = function (m) {
+    try {
+      var msg = JSON.parse(m);
+      if (msg.kind === 'event') {
+        if (msg.id === 'load') {
+          var name = 'd3-format';
+          host.importModule(name).then(function (mod) {
+            formatFn = mod.format;
+            state.loaded = true;
+            host.send('loaded:host.importModule');
+            render();
+          });
+        } else if (msg.id === 'input') {
+          state.value = Number(msg.value);
+          render();
+        } else if (msg.id.indexOf('spec:') === 0) {
+          state.spec = msg.id.slice(5);
+          render();
+        }
+      } else if (msg.kind === 'quit') {
+        if (done !== null) done();
+      }
+    } catch (e) {}
+  };
+  render();
+  return new Promise(function (r) { done = r; });
+})();
+</script>
+
+<!-- Guest 2: the same app as a module with a static import. -->
+<script type="text/plain" id="guest-import-code">
+import { format } from 'd3-format';
+var SPECS = ['.2f', ',.0f', '.0%', '($.2f'];
+var state = { value: 1234567.891, spec: '.2f' };
+function tree() {
+  var buttons = [];
+  for (var i = 0; i < SPECS.length; i++) {
+    buttons.push({ type: 'button', props: { onClick: 'spec:' + SPECS[i] }, children: [SPECS[i]] });
+  }
+  return { type: 'div', children: [
+    { type: 'p', children: ['Type a number, pick a format:'] },
+    { type: 'input', props: { type: 'number', value: String(state.value), onInput: 'input' } },
+    { type: 'div', children: buttons },
+    { type: 'p', children: ['Formatted (' + state.spec + '): ' + format(state.spec)(state.value)] },
+    { type: 'p', children: ['Formatter loaded via import(), from the cache.'] }
+  ] };
+}
+function render() {
+  host.send(JSON.stringify({ kind: 'render', tree: tree() }));
+}
+globalThis.onMessage = function (m) {
+  try {
+    var msg = JSON.parse(m);
+    if (msg.kind === 'event') {
+      if (msg.id === 'input') { state.value = Number(msg.value); render(); }
+      else if (msg.id.indexOf('spec:') === 0) { state.spec = msg.id.slice(5); render(); }
+    }
+  } catch (e) {}
+};
+render();
+await new Promise(function () {});
+</script>
+
+<script type="module">
+  import { Sandbox, renderGuestTree } from "/dist/index.js";
+
+  const statusEl = document.getElementById("status");
+  const setStatus = (line) => { statusEl.textContent = line; };
+  let prompts = 0;
+  let renderWaiter = null;
+
+  // The import map: the app decides which packages exist. The guest
+  // only picks among them, whether by literal import() or by name.
+  const IMPORTS = { "d3-format": location.origin + "/vendor/d3-format.mjs" };
+
+  const sandbox = await Sandbox.create({
+    iframeUrl: "/iframe.html",
+    onConnectionRequest: (req) => {
+      // Human-in-the-loop approval for the download origin. For the
+      // lazy button this fires on click, not on page load.
+      prompts++;
+      const ok = confirm("Allow the guest app to download a module from?\n\n" + req.origin + "\n\nThis is the one-time approval for the d3-format import. Later loads use the cache and never ask again.");
+      return ok ? "allow-session" : "deny";
+    },
+  });
+  sandbox.on("message", (m) => {
+    try {
+      const msg = JSON.parse(m);
+      if (msg && msg.kind === "render") {
+        renderGuestTree(document.getElementById("app-root"), msg.tree, {
+          onEvent: (id, value) => sandbox.send(JSON.stringify({ kind: "event", id, value })),
+        });
+        if (renderWaiter !== null) {
+          const resolve = renderWaiter;
+          renderWaiter = null;
+          resolve();
+        }
+        return;
+      }
+    } catch { /* not a render message */ }
+    if (m.indexOf("loaded:") === 0) {
+      setStatus("Loaded on demand via " + m.slice("loaded:".length) + ". Import prompts: " + prompts + ". Modules cached: " + sandbox.getImportCache().length + ".");
+    }
+  });
+  sandbox.on("error", (e) => setStatus("Guest error: " + e));
+
+  const lazyCode = document.getElementById("guest-lazy-code").textContent;
+  const importCode = document.getElementById("guest-import-code").textContent;
+  let currentRun = sandbox.run(lazyCode, { deadlineMs: 60000 }, IMPORTS);
+  currentRun.then(
+    () => {},
+    (e) => setStatus("Guest error: " + e.message),
+  );
+  // The first render announces the starting state (nothing downloaded).
+  const firstRender = new Promise((resolve) => { renderWaiter = resolve; });
+  await firstRender;
+  setStatus("Guest app rendered. Nothing downloaded yet — press Load formatter.");
+
+  document.getElementById("tryImport").addEventListener("click", async () => {
+    // End the lazy run, then start the same app as a module. Its
+    // import comes from the host-side cache: no prompt, no download.
+    sandbox.send(JSON.stringify({ kind: "quit" }));
+    try { await currentRun; } catch { /* the run may already have ended */ }
+    setStatus("Switching to the import() version…");
+    const rendered = new Promise((resolve) => { renderWaiter = resolve; });
+    currentRun = sandbox.run(importCode, { deadlineMs: 60000 }, IMPORTS);
+    currentRun.then(
+      () => {},
+      (e) => setStatus("Guest error: " + e.message),
+    );
+    await rendered;
+    setStatus("import() version rendered from cache. Import prompts still " + prompts + ", modules cached " + sandbox.getImportCache().length + " — no new prompt, no new download.");
+  });
+</script>
+</body>
+</html>

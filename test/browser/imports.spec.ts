@@ -170,6 +170,121 @@ test("every transitive hop is gated on its own origin", async ({ page }) => {
   expect(prompts).toEqual([CANARY, "http://127.0.0.1:8902"]);
 });
 
+test("downloaded, then re-rendered: lazy import resolves and the guest continues", async ({ page }) => {
+  await readyImport(page, { autoDecision: "allow-session" });
+  await resetCanary(page);
+  await page.evaluate(
+    (canary) => (window as any).harness.runWithImports(
+      `(async () => {
+         host.send("loading…");
+         const { format } = await import('d3-format');
+         host.send("formatted: " + format('.0f')(42));
+         return "done";
+       })()`,
+      { deadlineMs: 10000 },
+      { "d3-format": `${canary}/d3-format.mjs` },
+    ),
+    CANARY,
+  );
+  const messages = await page.evaluate(() => (window as any).harness.getMessages());
+  expect(messages).toEqual(["loading…", "formatted: 42"]);
+  const prompts = await page.evaluate(() => (window as any).harness.getPrompts());
+  expect(prompts).toEqual([CANARY]);
+  const log = await canaryLog(page);
+  expect(log.filter((e: { url: string }) => e.url === "/d3-format.mjs")).toHaveLength(1);
+});
+
+test("second dynamic import is cached: zero new fetches, zero new prompts", async ({ page }) => {
+  await readyImport(page, { autoDecision: "allow-session" });
+  await resetCanary(page);
+  const run = (canary: string) =>
+    page.evaluate(
+      (c) => (window as any).harness.runWithImports(
+        `(async () => {
+           const { format } = await import('d3-format');
+           host.send(format('.0f')(7));
+           return "done";
+         })()`,
+        { deadlineMs: 10000 },
+        { "d3-format": `${c}/d3-format.mjs` },
+      ),
+      canary,
+    );
+  await run(CANARY);
+  await run(CANARY);
+  const log = await canaryLog(page);
+  expect(log.filter((e: { url: string }) => e.url === "/d3-format.mjs")).toHaveLength(1);
+  const prompts = await page.evaluate(() => (window as any).harness.getPrompts());
+  expect(prompts).toEqual([CANARY]);
+});
+
+test("host.importModule downloads lazily at call time, not at run start", async ({ page }) => {
+  await readyImport(page, { autoDecision: "allow-session" });
+  await resetCanary(page);
+  // Start the run without awaiting it: the guest waits for a host
+  // message before importing, so the prompt must still be absent
+  // while it waits — proving the download happens at call time.
+  await page.evaluate(
+    (canary) => {
+      (window as any).__run = (window as any).harness.runWithImports(
+        `(async () => {
+           host.send("ready");
+           await new Promise((r) => { globalThis.onMessage = () => r(); });
+           const mod = await host.importModule('d3-format');
+           host.send(mod.format('.1f')(2.25));
+           return "done";
+         })()`,
+        { deadlineMs: 10000 },
+        { "d3-format": `${canary}/d3-format.mjs` },
+      );
+    },
+    CANARY,
+  );
+  await page.waitForFunction(
+    () => (window as any).harness.getMessages().includes("ready"),
+  );
+  let prompts = await page.evaluate(() => (window as any).harness.getPrompts());
+  expect(prompts).toEqual([]);
+  await page.evaluate(() => (window as any).harness.send("go"));
+  const result = await page.evaluate(() => (window as any).__run);
+  expect(result).toBe("done");
+  const messages = await page.evaluate(() => (window as any).harness.getMessages());
+  expect(messages).toContain("2.3");
+  prompts = await page.evaluate(() => (window as any).harness.getPrompts());
+  expect(prompts).toEqual([CANARY]);
+});
+
+test("host.importModule rejects unknown names", async ({ page }) => {
+  await readyImport(page, { autoDecision: "allow-session" });
+  await expect(
+    page.evaluate(
+      (canary) => (window as any).harness.runWithImports(
+        `(async () => { await host.importModule('evil'); })()`,
+        { deadlineMs: 10000 },
+        { "d3-format": `${canary}/d3-format.mjs` },
+      ),
+      CANARY,
+    ),
+  ).rejects.toThrow(/unknown import "evil"/);
+});
+
+test("computed import() of an unfetched module fails naming it", async ({ page }) => {
+  await readyImport(page, { autoDecision: "allow-session" });
+  await expect(
+    page.evaluate(
+      (canary) => (window as any).harness.runWithImports(
+        `(async () => {
+           const name = 'd3-format';
+           await import(name);
+         })()`,
+        { deadlineMs: 10000 },
+        { "d3-format": `${canary}/d3-format.mjs` },
+      ),
+      CANARY,
+    ),
+  ).rejects.toThrow(/could not load module 'd3-format'/);
+});
+
 test("pre-allowed origin imports with zero prompts", async ({ page }) => {
   await readyImport(page, { allowedOrigins: [CANARY], autoDecision: null });
   await page.evaluate(

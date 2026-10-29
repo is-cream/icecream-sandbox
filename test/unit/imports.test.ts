@@ -10,6 +10,7 @@ import {
   ImportCache,
   isModuleCode,
   resolveSpecifier,
+  scanDynamicImportSpecifiers,
   scanModuleSpecifiers,
   validateImportMap,
 } from "../../src/imports.js";
@@ -59,6 +60,36 @@ describe("scanModuleSpecifiers", () => {
   it("returns [] for classic scripts", () => {
     expect(scanModuleSpecifiers(`host.send("hi"); "done"`)).toEqual([]);
     expect(scanModuleSpecifiers(`const s = "import not from 'real'";`)).toEqual([]);
+  });
+});
+
+describe("scanDynamicImportSpecifiers", () => {
+  it("finds string-literal dynamic imports", () => {
+    const code = `
+      const a = await import('x');
+      const b = await import("y");
+      const c = await import(
+        'z'
+      );
+    `;
+    expect(scanDynamicImportSpecifiers(code)).toEqual(["x", "y", "z"]);
+  });
+
+  it("ignores computed specifiers, templates, comments, and strings", () => {
+    const code = `
+      const a = await import(name);
+      const b = await import(\`./\${name}.mjs\`);
+      // const c = await import('nope');
+      const s = "await import('nope2');";
+      import staticName from 'static';
+    `;
+    expect(scanDynamicImportSpecifiers(code)).toEqual([]);
+  });
+
+  it("dedupes while keeping first-seen order", () => {
+    expect(
+      scanDynamicImportSpecifiers(`await import('x'); await import('y'); await import('x');`),
+    ).toEqual(["x", "y"]);
   });
 });
 
@@ -271,5 +302,139 @@ describe("GuestRunner module execution (real d3-format)", () => {
       { wrapper: wrapperUrl },
     );
     expect(messages).toEqual(["1,234,567"]);
+  });
+});
+
+describe("GuestRunner dynamic imports", () => {
+  it("a classic script keeps its result while lazy-loading a module", async () => {
+    // Classic semantics preserved: the IIFE's return value is still the
+    // run result, even though the run also used import().
+    const { messages, result } = await driveModule(
+      `(async () => {
+         const { format } = await import('d3-format');
+         host.send(format('.2f')(3.14159));
+         return "done";
+       })()`,
+      { [D3_URL]: D3_FORMAT },
+      D3_MAP,
+    );
+    expect(messages).toEqual(["3.14"]);
+    expect(result).toBe("done");
+  });
+
+  it("downloaded, then re-rendered: loading message first, formatted second", async () => {
+    const { messages } = await driveModule(
+      `(async () => {
+         host.send("loading…");
+         const { format } = await import('d3-format');
+         host.send("formatted: " + format('.0f')(42));
+         return "done";
+       })()`,
+      { [D3_URL]: D3_FORMAT },
+      D3_MAP,
+    );
+    expect(messages).toEqual(["loading…", "formatted: 42"]);
+  });
+
+  it("a module guest can dynamic-import too (top-level await)", async () => {
+    const { messages } = await driveModule(
+      `import { format as staticFormat } from 'd3-format';
+       const { format } = await import('d3-format');
+       host.send(staticFormat('.1f')(1.25) + "/" + format('.1f')(2.25));`,
+      { [D3_URL]: D3_FORMAT },
+      D3_MAP,
+    );
+    expect(messages).toEqual(["1.3/2.3"]);
+  });
+
+  it("host.importModule loads a computed name and resolves with the namespace", async () => {
+    const { messages } = await driveModule(
+      `(async () => {
+         const name = 'd3-format';
+         const mod = await host.importModule(name);
+         host.send(mod.format('.2f')(1.5));
+         return "done";
+       })()`,
+      { [D3_URL]: D3_FORMAT },
+      D3_MAP,
+    );
+    expect(messages).toEqual(["1.50"]);
+  });
+
+  it("host.importModule resolves only map keys, never arbitrary names", async () => {
+    await expect(
+      driveModule(
+        `(async () => { await host.importModule('evil'); })()`,
+        {},
+        D3_MAP,
+      ),
+    ).rejects.toThrow(/unknown import "evil"/);
+  });
+
+  it("host.importModule follows transitive deps of the loaded module", async () => {
+    const wrapperUrl = "https://cdn.example/wrapper.mjs";
+    const { messages } = await driveModule(
+      `(async () => {
+         const mod = await host.importModule('wrapper');
+         host.send(mod.format(',.0f')(1234567));
+         return "done";
+       })()`,
+      {
+        [wrapperUrl]: `export { format } from './d3-format.mjs';`,
+        [D3_URL]: D3_FORMAT,
+      },
+      { wrapper: wrapperUrl },
+    );
+    expect(messages).toEqual(["1,234,567"]);
+  });
+
+  it("host.importModule waits for the module's top-level await", async () => {
+    const tlaUrl = "https://cdn.example/tla.mjs";
+    const { messages } = await driveModule(
+      `(async () => {
+         const mod = await host.importModule('tla');
+         host.send("value=" + mod.value);
+         return "done";
+       })()`,
+      { [tlaUrl]: `await Promise.resolve(); export const value = 7;` },
+      { tla: tlaUrl },
+    );
+    expect(messages).toEqual(["value=7"]);
+  });
+
+  it("a computed import() of a not-yet-downloaded module fails naming it", async () => {
+    // QuickJS replaces dynamic-import load failures with its own
+    // generic text (the normalizer's guidance never surfaces here),
+    // so the failure names the module and nothing else. The
+    // documented path for a computed name is host.importModule (see
+    // the test above it), which downloads at call time.
+    await expect(
+      driveModule(
+        `(async () => {
+           const name = 'd3-format';
+           await import(name);
+         })()`,
+        { [D3_URL]: D3_FORMAT },
+        D3_MAP,
+      ),
+    ).rejects.toThrow(/could not load module 'd3-format'/);
+  });
+
+  it("a computed import() works once the module is already downloaded", async () => {
+    // The literal import up front downloads the module; the computed
+    // import later resolves from the same pre-fetched map.
+    const { messages } = await driveModule(
+      `(async () => {
+         const { format: f1 } = await import('d3-format');
+         host.send(f1('.1f')(1.25));
+         const name = 'd3-format';
+         const { format: f2 } = await import(name);
+         host.send(f2('.1f')(2.25));
+         return "done";
+       })()`,
+      { [D3_URL]: D3_FORMAT },
+      D3_MAP,
+    );
+    expect(messages).toEqual(["1.3", "2.3"]);
   });
 });

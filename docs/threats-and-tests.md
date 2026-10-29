@@ -332,6 +332,23 @@ Test name references below are exact. Unit tests live in
   own origin` (a cross-origin hop prompts a second time, for the
   second origin).
 
+### T27. Dynamic import abuse (computed specifiers)
+
+- **Attack:** guest code computing a specifier at runtime to import
+  an attacker URL the app never approved, or to probe the import map.
+- **Prevention:** `host.importModule` accepts only keys in the
+  host-supplied import map — the app decides which packages exist,
+  and the guest only picks among them. A computed `import()` of a
+  module that was never downloaded fails naming the module (QuickJS
+  substitutes its own generic text for dynamic-import load failures,
+  so no map contents leak through the error). Literal dynamic
+  imports are still gate-approved downloads like any other import.
+- **Tests:** browser imports `host.importModule downloads lazily at
+  call time` (the prompt is absent while the guest waits, present
+  after it asks), `host.importModule rejects unknown names`, and
+  `computed import() of an unfetched module fails naming it`; unit
+  `host.importModule resolves only map keys`.
+
 ## Bugs caught by this suite
 
 The security suite is not decorative — it has already caught real

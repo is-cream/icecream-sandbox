@@ -262,8 +262,9 @@ host.send(JSON.stringify({ kind: "render", tree: /* ... */, css }));
 ## Guest ES module imports
 
 Guest code may use static `import` statements — including real
-packages, not just relative files. There is no install step: the host
-app declares an import map, and the sandbox does the rest.
+packages, not just relative files — and dynamic imports too. There
+is no install step: the host app declares an import map, and the
+sandbox does the rest.
 
 ```js
 const sandbox = await Sandbox.create({ iframeUrl: "/sandbox/iframe.html" });
@@ -307,14 +308,35 @@ How it works:
   reason: a floating specifier is supply-chain drift. The library
   does not re-resolve or update anything on its own.
 
-Limits: only static imports are resolved. Dynamic `import()` with a
-computed specifier cannot be pre-fetched and fails at runtime with a
-clear error. A module source must also fit `maxInboundBytes` to cross
-the port (default 1 MiB, same as the gate's response cap).
+### Dynamic imports
+
+There are two dynamic paths, and they differ only in when the name
+is known:
+
+- **Literal `import('d3-format')`.** The specifier is visible in the
+  code, so the sandbox pre-fetches it with the rest of the import
+  graph and the module evaluates lazily when `import()` runs. The
+  guest then re-renders with it, exactly like a lazy import in a
+  browser — the download happened up front, the evaluation did not.
+- **Computed `import(name)`.** A variable holding the name cannot be
+  known ahead of time, so it cannot be pre-fetched. For those, the
+  guest calls `host.importModule(name)` instead: it downloads through
+  the same gate and cache **at call time** and resolves with the
+  module's namespace, so the guest re-renders with it. A computed
+  `import()` of a module that was never downloaded fails naming the
+  module — that is the signal to use `host.importModule`.
+
+One rule covers both paths: `host.importModule` accepts only names
+in the import map. The app decides which packages exist; the guest
+only picks among them, whether by literal import or by name.
+
+Limits: a module source must fit `maxInboundBytes` to cross the port
+(default 1 MiB, same as the gate's response cap).
 
 See `examples/import-package.html` for a working guest app that
-imports the real d3-format package, and `docs/design.md` for the
-resolution diagram.
+imports the real d3-format package, `examples/dynamic-import.html`
+for lazy loading on click plus the `import()` version running from
+cache, and `docs/design.md` for the resolution diagram.
 
 ## Rendering guest UI (JSX / React components)
 
@@ -457,6 +479,13 @@ are unavailable.
   import come from the cache with no new prompt and no new download.
   Run `npm run demo`, then open `/examples/import-package.html`. A
   screenshot of it is in `examples/import-package.png`.
+- `examples/dynamic-import.html` — a guest app that starts with
+  nothing downloaded: press Load formatter and the guest imports
+  d3-format by name at that moment (one approval, then a re-render),
+  then press Try the import() version and watch the same app restart
+  as a module rendering from the cache. Run `npm run demo`, then open
+  `/examples/dynamic-import.html`. A screenshot of it is in
+  `examples/dynamic-import.png`.
 
 ## Development
 

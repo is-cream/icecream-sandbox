@@ -14,6 +14,7 @@ export {
   ImportCache,
   isModuleCode,
   resolveSpecifier,
+  scanDynamicImportSpecifiers,
   scanModuleSpecifiers,
   validateImportMap,
   type ImportMap,
