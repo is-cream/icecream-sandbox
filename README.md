@@ -490,6 +490,8 @@ are unavailable.
   chart libraries, two import styles: Chart.js 4.6.1 via a static
   import (with its transitive `@kurkle/color` dependency) and
   Chartist 1.3.1 via a dynamic `host.importModule` on button click.
+  The guest builds both charts with the real libraries (a Chart.js
+  config, a Chartist-normalized series) and the host paints the SVG.
   Run `npm run demo`, then open
   `/examples/static-dynamic-imports.html`. A screenshot of it is in
   `examples/static-dynamic-imports.png`.

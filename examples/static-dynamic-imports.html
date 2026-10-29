@@ -7,9 +7,11 @@
 <style>
   body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; }
   #app-root { border: 1px solid #ccc; border-radius: 12px; padding: 1rem 1.25rem; margin: 1rem 0; }
+  .chart-box { border: 1px solid #ccc; border-radius: 12px; padding: 1rem 1.25rem; margin: 1rem 0; }
+  .chart-box h3 { margin-top: 0; }
   #status { background: #111; color: #eee; padding: 0.75rem 1rem; border-radius: 8px; min-height: 1.5rem; }
   code { background: #f0f0f0; padding: 0 0.25rem; border-radius: 4px; }
-  pre { background: #f7f7f7; padding: 0.75rem; border-radius: 8px; overflow-x: auto; }
+  svg text { font-family: system-ui, sans-serif; }
 </style>
 </head>
 <body>
@@ -17,19 +19,35 @@
 <p>
   One guest app, two real chart libraries, two import styles. The app
   is a module running inside QuickJS in a Web Worker inside a
-  sandboxed iframe (<code>icecream-sandbox</code>).
+  sandboxed iframe (<code>icecream-sandbox</code>). The guest has no
+  DOM and no canvas, so it cannot paint pixels — it does what the
+  libraries are really for here: it <strong>builds the charts with
+  them</strong>, and the host paints the SVG from what the guest
+  computed.
 </p>
 <ul>
   <li><strong>Static:</strong> the first line is
     <code>import { Chart } from 'chart.js'</code> — Chart.js 4.6.1
     downloads with the import graph (including its own dependency,
-    <code>@kurkle/color</code>) and is ready before anything runs.</li>
+    <code>@kurkle/color</code>) and is ready before anything runs.
+    The bar chart below is painted from the Chart.js config the guest
+    built.</li>
   <li><strong>Dynamic:</strong> press <strong>Load Chartist</strong>
     and the guest imports Chartist 1.3.1 <em>by name, at that
     moment</em> — the host approves the origin, the module downloads,
-    and the guest re-renders with it.</li>
+    the guest normalizes a data series with the real
+    <code>Chartist.normalizeData</code>, and the host paints the line
+    chart from the normalized data.</li>
 </ul>
 <div id="app-root"></div>
+<div class="chart-box">
+  <h3>Static import: Chart.js bar chart</h3>
+  <div id="static-chart"></div>
+</div>
+<div class="chart-box">
+  <h3>Dynamic import: Chartist line chart</h3>
+  <div id="dynamic-chart"><p style="color:#666">Not loaded yet — press Load Chartist above.</p></div>
+</div>
 <p id="status">Loading guest app…</p>
 <p>
   Both downloads go through the same connection gate and the same
@@ -45,11 +63,12 @@
 import { Chart } from 'chart.js';
 import * as ChartNS from 'chart.js';
 
-var state = { chartist: null, sumResult: null, lineChartType: null };
+var state = { chartist: null, total: null };
 var done = null;
 
 // A real Chart.js config, built with the statically imported library.
-var chartConfig = {
+// The host paints the bar chart from this config's data.
+var barConfig = {
   type: 'bar',
   data: {
     labels: ['Q1', 'Q2', 'Q3', 'Q4'],
@@ -60,23 +79,22 @@ var chartConfig = {
 
 function tree() {
   var kids = [
-    { type: 'h2', children: ['Static import: Chart.js'] },
     { type: 'p', children: [
       'Chart.js ' + Chart.version + ' loaded with a static import. ' +
       'The module ships ' + Object.keys(ChartNS).length + ' named exports; ' +
-      'its own dependency @kurkle/color downloaded as a transitive hop.'
-    ] },
-    { type: 'pre', children: [JSON.stringify(chartConfig, null, 1)] },
-    { type: 'h2', children: ['Dynamic import: Chartist'] }
+      'its own dependency @kurkle/color downloaded as a transitive hop. ' +
+      'The bar chart below is painted from the Chart.js config the guest built.'
+    ] }
   ];
   if (state.chartist === null) {
     kids.push({ type: 'button', props: { onClick: 'load' }, children: ['Load Chartist'] });
-    kids.push({ type: 'p', children: ['Not loaded yet. Nothing downloaded for Chartist yet.'] });
+    kids.push({ type: 'p', children: ['Chartist is not loaded yet. Nothing downloaded for it yet.'] });
   } else {
     kids.push({ type: 'p', children: [
-      'Chartist loaded on demand via host.importModule. ' +
-      'sum(19, 23) = ' + state.sumResult + '; ' +
-      'LineChart is a ' + state.lineChartType + '.'
+      'Chartist 1.3.1 loaded on demand via host.importModule. ' +
+      'The guest normalized the weekly series with the real Chartist.normalizeData ' +
+      'and summed it with Chartist.sum: total ' + state.total + '. ' +
+      'The line chart below is painted from the normalized data.'
     ] });
   }
   return { type: 'div', children: kids };
@@ -90,9 +108,16 @@ globalThis.onMessage = function (m) {
     if (msg.kind === 'event' && msg.id === 'load') {
       var name = 'chartist';
       host.importModule(name).then(function (mod) {
+        var raw = { labels: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'], series: [[5, 2, 4, 2, 0]] };
+        var normalized = mod.normalizeData(raw);
+        state.total = normalized.series[0].reduce(mod.sum, 0);
         state.chartist = mod;
-        state.sumResult = mod.sum(19, 23);
-        state.lineChartType = typeof mod.LineChart;
+        host.send(JSON.stringify({
+          kind: 'chart', target: 'dynamic-chart', chartType: 'line',
+          title: 'Weekly signups (Chartist 1.3.1, normalized in the guest)',
+          labels: normalized.labels,
+          series: [{ label: 'Signups', values: normalized.series[0] }]
+        }));
         host.send('loaded:host.importModule');
         render();
       });
@@ -101,6 +126,14 @@ globalThis.onMessage = function (m) {
     }
   } catch (e) {}
 };
+// The static chart spec goes out with the first render: Chart.js was
+// ready before the module ran, so its chart needs no click.
+host.send(JSON.stringify({
+  kind: 'chart', target: 'static-chart', chartType: 'bar',
+  title: 'Quarterly revenue (Chart.js ' + Chart.version + ')',
+  labels: barConfig.data.labels,
+  series: [{ label: barConfig.data.datasets[0].label, values: barConfig.data.datasets[0].data }]
+}));
 render();
 await new Promise(function (r) { done = r; });
 </script>
@@ -117,6 +150,48 @@ await new Promise(function (r) { done = r; });
     "chart.js": location.origin + "/vendor/chart.js.mjs",
     "chartist": location.origin + "/vendor/chartist.mjs",
   };
+
+  // Paint an SVG chart from a guest-computed spec. The guest builds
+  // the chart with the real library; the host only draws pixels.
+  function drawChart(targetId, spec) {
+    const W = 560, H = 340, P = { l: 46, r: 16, t: 40, b: 46 };
+    const iw = W - P.l - P.r, ih = H - P.t - P.b;
+    const allValues = spec.series.flatMap((s) => s.values);
+    const maxV = Math.max(...allValues, 1);
+    const yMax = Math.ceil(maxV / 100) * 100 || maxV;
+    const x = (i) => P.l + (iw / spec.labels.length) * (i + 0.5);
+    const y = (v) => P.t + ih - (ih * v) / yMax;
+    const ACCENT = "#2563eb";
+    let inner = `<text x="${W / 2}" y="22" text-anchor="middle" font-size="15" font-weight="600">${spec.title}</text>`;
+    for (let t = 0; t <= 4; t++) {
+      const v = (yMax * t) / 4, yy = y(v);
+      inner += `<line x1="${P.l}" y1="${yy}" x2="${W - P.r}" y2="${yy}" stroke="#e5e5e5"/>` +
+        `<text x="${P.l - 8}" y="${yy + 4}" text-anchor="end" font-size="11" fill="#666">${Math.round(v)}</text>`;
+    }
+    if (spec.chartType === "bar") {
+      const bw = (iw / spec.labels.length) * 0.55;
+      spec.series[0].values.forEach((v, i) => {
+        const bx = x(i) - bw / 2, by = y(v);
+        inner += `<rect x="${bx}" y="${by}" width="${bw}" height="${P.t + ih - by}" rx="4" fill="${ACCENT}"/>` +
+          `<text x="${x(i)}" y="${by - 6}" text-anchor="middle" font-size="11" font-weight="600">${v}</text>`;
+      });
+    } else {
+      const vals = spec.series[0].values;
+      const pts = vals.map((v, i) => `${x(i)},${y(v)}`).join(" ");
+      inner += `<polyline points="${pts}" fill="none" stroke="${ACCENT}" stroke-width="2.5"/>`;
+      vals.forEach((v, i) => {
+        inner += `<circle cx="${x(i)}" cy="${y(v)}" r="4.5" fill="${ACCENT}"/>` +
+          `<text x="${x(i)}" y="${y(v) - 10}" text-anchor="middle" font-size="11" font-weight="600">${v}</text>`;
+      });
+    }
+    spec.labels.forEach((label, i) => {
+      inner += `<text x="${x(i)}" y="${P.t + ih + 20}" text-anchor="middle" font-size="11" fill="#666">${label}</text>`;
+    });
+    inner += `<line x1="${P.l}" y1="${P.t}" x2="${P.l}" y2="${P.t + ih}" stroke="#999"/>` +
+      `<line x1="${P.l}" y1="${P.t + ih}" x2="${W - P.r}" y2="${P.t + ih}" stroke="#999"/>`;
+    document.getElementById(targetId).innerHTML =
+      `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto" role="img">${inner}</svg>`;
+  }
 
   const sandbox = await Sandbox.create({
     iframeUrl: "/iframe.html",
@@ -138,7 +213,11 @@ await new Promise(function (r) { done = r; });
         });
         return;
       }
-    } catch { /* not a render message */ }
+      if (msg && msg.kind === "chart") {
+        drawChart(msg.target, msg);
+        return;
+      }
+    } catch { /* not a JSON message */ }
     if (m.indexOf("loaded:") === 0) {
       setStatus("Chartist loaded on demand via " + m.slice("loaded:".length) + ". Import prompts: " + prompts + ". Modules cached: " + sandbox.getImportCache().length + ".");
     }

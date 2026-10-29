@@ -464,7 +464,8 @@ describe("GuestRunner dynamic imports", () => {
       `(async () => {
          const name = 'chartist';
          const mod = await host.importModule(name);
-         host.send(mod.sum(19, 23) + "/" + typeof mod.LineChart);
+         host.send(mod.sum(19, 23) + "/" + typeof mod.LineChart + "/" +
+                   mod.normalizeData({labels: ["Mon", "Tue"], series: [[5, 2]]}).labels.join("+"));
          return "done";
        })()`,
       {
@@ -475,7 +476,7 @@ describe("GuestRunner dynamic imports", () => {
       },
       { chartist: CHARTIST_URL },
     );
-    expect(messages).toEqual(["42/function"]);
+    expect(messages).toEqual(["42/function/Mon+Tue"]);
   });
 
   it("a computed import() works once the module is already downloaded", async () => {
